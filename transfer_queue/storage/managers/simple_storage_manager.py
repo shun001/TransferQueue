@@ -46,6 +46,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
+    frame_nbytes,
     with_zmq_socket,
 )
 
@@ -941,6 +942,8 @@ class AsyncSimpleStorageManager(StorageManager):
                 target_id=target_storage_unit,
                 global_indexes=global_indexes,
                 fields=fields,
+                data_parser=data_parser,
+                parser_args=parser_args,
             )
         except PayloadTransferTimeout as e:
             raise StorageUnitTimeout(

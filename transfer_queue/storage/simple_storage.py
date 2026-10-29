@@ -1373,9 +1373,18 @@ class SimpleStorageUnit:
         except Exception:
             return None
 
-    def _load_data(self, fields: list[str], global_indexes: list[int]) -> dict[str, list]:
+    def _load_data(
+        self,
+        fields: list[str],
+        global_indexes: list[int],
+        data_parser: Callable[..., Any] | None = None,
+        parser_args: list | None = None,
+    ) -> dict[str, list]:
         try:
-            return self.storage_data.get_data(fields, global_indexes)
+            data = self.storage_data.get_data(fields, global_indexes)
+            if data_parser is not None:
+                data = _apply_data_parser(data, data_parser, parser_args)
+            return data
         except StorageKeyNotFoundError as exc:
             raise StorageKeyNotFoundError(f"{KEY_NOT_FOUND_MARKER}: {exc}") from exc
 

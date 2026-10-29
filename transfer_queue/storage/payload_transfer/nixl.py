@@ -239,6 +239,8 @@ class NixlPayloadTransfer(PayloadTransfer):
         target_id: str,
         global_indexes: list[int],
         fields: list[str],
+        data_parser: Callable[[dict[str, list], list | None], dict[str, list]] | None = None,
+        parser_args: list | None = None,
     ) -> dict[str, Any]:
         transfer_id = uuid4().hex
         remote_prepared = False
@@ -249,7 +251,10 @@ class NixlPayloadTransfer(PayloadTransfer):
                 request_type=ZMQRequestType.GET_DATA_PREPARE,
                 sender_id=sender_id,
                 receiver_id=target_id,
-                body={"global_indexes": global_indexes, "fields": fields, "transfer_id": transfer_id},
+                body={
+                    "global_indexes": global_indexes, "fields": fields, "transfer_id": transfer_id,
+                    "data_parser": data_parser, "parser_args": parser_args,
+                },
             )
             await control_socket.send_multipart(prepare.serialize(), copy=False)
             remote_prepared = True
@@ -391,7 +396,12 @@ class NixlPayloadTransfer(PayloadTransfer):
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] GET prepare"
             ):
-                frames = tuple(encode(load_data(request.body["fields"], request.body["global_indexes"])))
+                data = load_data(
+                    request.body["fields"], request.body["global_indexes"],
+                    data_parser=request.body.get("data_parser"),
+                    parser_args=request.body.get("parser_args"),
+                )
+                frames = tuple(encode(data))
             descriptor = PayloadDescriptor(
                 transfer_id=transfer_id,
                 payload_bytes=calc_packed_size(frames),

@@ -74,6 +74,8 @@ class PayloadTransfer(ABC):
         target_id: str,
         global_indexes: list[int],
         fields: list[str],
+        data_parser: Callable[[dict[str, list], list | None], dict[str, list]] | None = None,
+        parser_args: list | None = None,
     ) -> dict[str, Any]:
         """Get storage data through this strategy."""
 

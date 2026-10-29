@@ -72,12 +72,17 @@ class ZmqPayloadTransfer(PayloadTransfer):
         target_id: str,
         global_indexes: list[int],
         fields: list[str],
+        data_parser: Callable[[dict[str, list], list | None], dict[str, list]] | None = None,
+        parser_args: list | None = None,
     ) -> dict[str, Any]:
         request = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=sender_id,
             receiver_id=target_id,
-            body={"global_indexes": global_indexes, "fields": fields},
+            body={
+                "global_indexes": global_indexes, "fields": fields,
+                "data_parser": data_parser, "parser_args": parser_args,
+            },
         )
         try:
             await control_socket.send_multipart(request.serialize())
@@ -125,7 +130,11 @@ class ZmqPayloadTransfer(PayloadTransfer):
                 with limit_pytorch_auto_parallel_threads(
                     target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] _handle_get"
                 ):
-                    data = load_data(fields, global_indexes)
+                    data = load_data(
+                        fields, global_indexes,
+                        data_parser=request.body.get("data_parser"),
+                        parser_args=request.body.get("parser_args"),
+                    )
                 return self._response(ZMQRequestType.GET_DATA_RESPONSE, storage_id, {"data": data})
             except Exception as exc:
                 log = logger.debug if KEY_NOT_FOUND_MARKER in str(exc) else logger.error

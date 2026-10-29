@@ -75,7 +75,7 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
-    def load_data(fields, global_indexes):
+    def load_data(fields, global_indexes, **kwargs):
         try:
             return storage_data.get_data(fields, global_indexes)
         except StorageKeyNotFoundError as exc:

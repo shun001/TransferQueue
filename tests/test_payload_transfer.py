@@ -107,7 +107,7 @@ def test_zmq_payload_transfer_handles_put_and_get_requests():
     put_response = transfer.handle_request(
         put_request,
         storage_id="storage",
-        load_data=lambda fields, indexes: {field: stored[field] for field in fields},
+        load_data=lambda fields, indexes, **kwargs: {field: stored[field] for field in fields},
         store_data=lambda indexes, data, parser: stored.update(data),
     )
 
@@ -123,7 +123,7 @@ def test_zmq_payload_transfer_handles_put_and_get_requests():
     get_response = transfer.handle_request(
         get_request,
         storage_id="storage",
-        load_data=lambda fields, indexes: {field: stored[field] for field in fields},
+        load_data=lambda fields, indexes, **kwargs: {field: stored[field] for field in fields},
         store_data=lambda indexes, data, parser: stored.update(data),
     )
 
@@ -144,3 +144,55 @@ def test_public_config_defaults_to_zmq_payload_transfer():
     config = OmegaConf.load(Path(__file__).parents[1] / "transfer_queue/config.yaml")
 
     assert config.backend.SimpleStorage.payload_transfer.backend == "zmq"
+
+
+@pytest.mark.parametrize("backend", ["zmq", "nixl-ucx"])
+@pytest.mark.parametrize("invalid", [None, "keys", "length", "raises"])
+def test_get_parser_runs_on_storage_before_transfer(backend, invalid):
+    from unittest.mock import MagicMock
+
+    from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
+    from transfer_queue.storage.simple_storage import SimpleStorageUnit
+    from transfer_queue.utils.serial_utils import decode
+
+    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = object.__new__(unit_class)
+    unit.storage_data = MagicMock()
+    unit.storage_data.get_data.return_value = {"value": [2, 3]}
+    calls = []
+
+    def parser(data, args):
+        calls.append(args)
+        if invalid == "keys":
+            return {"other": data["value"]}
+        if invalid == "length":
+            return {"value": [2]}
+        if invalid == "raises":
+            raise ValueError("parser failed")
+        return {"value": [value + arg for value, arg in zip(data["value"], args, strict=True)]}
+
+    if backend == "zmq":
+        transfer = ZmqPayloadTransfer()
+        operation = ZMQRequestType.GET_DATA
+    else:
+        transfer = object.__new__(NixlPayloadTransfer)
+        transfer._pending_gets = {}
+        operation = ZMQRequestType.GET_DATA_PREPARE
+    request = ZMQMessage.create(
+        request_type=operation,
+        sender_id="manager",
+        body={"fields": ["value"], "global_indexes": [0, 1], "transfer_id": "parser",
+              "data_parser": parser, "parser_args": [10, 20]},
+    )
+    reply = transfer.handle_request(
+        request, storage_id="storage", load_data=unit._load_data, store_data=lambda *_: None,
+    )
+    assert calls == [[10, 20]]
+    if invalid is not None:
+        assert reply.request_type in (ZMQRequestType.GET_ERROR, ZMQRequestType.PUT_GET_ERROR)
+        if backend == "nixl-ucx":
+            assert not transfer._pending_gets
+    elif backend == "zmq":
+        assert reply.body["data"] == {"value": [12, 23]}
+    else:
+        assert decode(transfer._pending_gets["parser"].frames) == {"value": [12, 23]}
