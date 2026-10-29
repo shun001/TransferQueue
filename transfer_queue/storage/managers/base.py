@@ -226,20 +226,29 @@ class StorageManager(ABC):
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
+        ready: bool = True,
+    ) -> bool:
         """
-        Notify controller that new data is ready.
+        Notify controller that new data is stored.
 
         Args:
             partition_id: Current data partition id.
             global_indexes: Data update related global_indexes.
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}.
             custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
+            ready: Whether consumers may see the data now; False for a kv_update with finalize=False.
+
+        Returns:
+            True if the controller recorded the data. False if no ACK arrived (the outcome is
+            unknown) or the partition no longer exists (the data is dropped, with a warning).
+
+        Raises:
+            RuntimeError: If the controller failed to record the data, e.g. on a dtype conflict.
         """
 
         if not self.controller_info:
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
-            return
+            return False
 
         normalized_field_schema = {}
         for field_name, field in field_schema.items():
@@ -264,6 +273,7 @@ class StorageManager(ABC):
                 "global_indexes": global_indexes,
                 "field_schema": normalized_field_schema,
                 "custom_backend_meta": custom_backend_meta,
+                "ready": ready,
             },
         ).serialize()
 
@@ -271,10 +281,16 @@ class StorageManager(ABC):
             self._notify_and_wait(request_msg),
             self._notify_loop,
         )
-        await asyncio.wrap_future(thread_future)
+        accepted = await asyncio.wrap_future(thread_future)
+        if accepted is False:
+            logger.warning(
+                f"[{self.storage_manager_id}]: Partition {partition_id!r} no longer exists; "
+                f"the controller dropped {len(global_indexes)} written samples"
+            )
+        return accepted is True
 
-    async def _notify_and_wait(self, request_msg: list) -> None:
-        """Send a data status notification to the controller and block until ACK is received."""
+    async def _notify_and_wait(self, request_msg: list) -> bool | None:
+        """Return ACK success, or None if no reply arrived; raise on REQUEST_ERROR."""
         # Acquiring the lease sits outside the handler below: a missing socket name or a dead
         # context is a configuration/lifecycle fault the caller must see, not a slow ACK.
         async with self.notify_pool.alease(self.controller_info) as sock:
@@ -297,17 +313,25 @@ class StorageManager(ABC):
                     messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=remaining)
                     response_msg = ZMQMessage.deserialize(messages)
 
-                    if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        logger.debug(
-                            f"[{self.storage_manager_id}]: Get data status update ACK response "
-                            f"from controller id #{response_msg.sender_id} successfully."
-                        )
-                        return
+                    if response_msg.request_type in (
+                        ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+                        ZMQRequestType.REQUEST_ERROR,
+                    ):
+                        break
             except Exception as e:
                 # Logged rather than raised, so a slow controller does not fail the put. Close
                 # the socket: a late ACK would otherwise be read as the next lessee's reply.
                 logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
                 sock.close(linger=0)
+                return None
+
+        logger.debug(
+            f"[{self.storage_manager_id}]: Received data status update response "
+            f"from controller id #{response_msg.sender_id}: {response_msg.body}."
+        )
+        if response_msg.request_type == ZMQRequestType.REQUEST_ERROR:
+            raise RuntimeError(f"Controller failed to record written data: {response_msg.body['message']}")
+        return bool(response_msg.body["success"])
 
     @abstractmethod
     async def put_data(
@@ -332,12 +356,21 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement put_data")
 
     @abstractmethod
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Get data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be retrieved from the storage.
+            data_parser: Optional ``data_parser(data, args)`` applied where the data is stored,
+                before it is sent. See ``transfer_queue.kv_batch_get``. Only supported by
+                SimpleStorage backend.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing the data retrieved from the storage.
@@ -345,14 +378,40 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement get_data")
 
     @abstractmethod
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """
         Clear data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be cleared from the storage.
+            fields: If given, delete only these fields and keep the samples.
         """
         raise NotImplementedError("Subclasses must implement clear_data")
+
+    async def update_data(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+        finalize: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """Merge new values on the unit that holds each sample, or store them if absent.
+
+        Args:
+            metadata: Samples to update.
+            values: New values as a TensorDict aligned with ``metadata``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
+            merge_plan: ``{field: {"dtype", "is_non_tensor", "held"}}`` from the controller;
+                ``held`` is aligned with ``metadata`` and decides which rows merge.
+            finalize: If False, keep the updated fields hidden from consumers.
+
+        Returns:
+            field_schema of the stored values, keyed by field name.
+        """
+        raise NotImplementedError(
+            f"kv_update is not supported by {self.__class__.__name__}; it requires the SimpleStorage backend"
+        )
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Save storage state into checkpoint_dir.
@@ -372,6 +431,22 @@ class StorageManager(ABC):
             NotImplementedError: If this storage backend does not support checkpoint.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support checkpoint")
+
+    async def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Have the owner units write the given rows into shards under shard_dir.
+
+        Raises:
+            NotImplementedError: If this storage backend does not support selective dumps.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support selective data dump")
+
+    async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
+        """Have the current owner units read dumped rows at their target indexes.
+
+        Raises:
+            NotImplementedError: If this storage backend does not support selective loads.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support selective data load")
 
     def close(self) -> None:
         """Close all ZMQ sockets/contexts and stop the notify loop."""
@@ -784,13 +859,22 @@ class KVStorageManager(StorageManager):
             per_field_custom_backend_meta,
         )
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Retrieve tensor data from the backend storage.
 
         Fetches tensors using the provided metadata, reconstructs them with the
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
+        if data_parser is not None:
+            raise NotImplementedError(
+                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
+            )
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
@@ -801,9 +885,13 @@ class KVStorageManager(StorageManager):
         )
         return self._merge_tensors_to_tensordict(metadata, values)
 
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Remove stored data associated with the given metadata."""
 
+        if fields is not None:
+            metadata = metadata.select_fields(fields)
+            if not metadata.field_names:
+                return
         if not metadata.field_names:
             raise RuntimeError(
                 "Fail to clear_data for key-value based backends due to lack of `field_names` in BatchMeta"

@@ -1310,6 +1310,71 @@ class TestFieldMetaIntegration:
         assert field_meta.global_indexes == {0, 1}
         assert field_meta.per_sample_shapes == {}
 
+    def test_clear_fields_keeps_samples_and_other_columns(self):
+        """Clearing one sample's field leaves the field's schema for other samples intact."""
+        import torch
+
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1, 2], ["pv", "ids"], {"pv": t4, "ids": t4})
+        partition.keys_mapping = {"a": 0, "b": 1, "c": 2}
+        partition.custom_meta = {0: {"tag": "a"}}
+        partition.field_custom_backend_meta = {0: {"pv": "m0", "ids": "i0"}}
+        partition.consumption_status["task"] = torch.ones(3, dtype=torch.int8)
+
+        partition.clear_fields([0], ["pv"])
+
+        pv_col = partition.field_name_mapping["pv"]
+        ids_col = partition.field_name_mapping["ids"]
+        assert partition.production_status[:3, pv_col].tolist() == [0, 1, 1]
+        assert partition.production_status[:3, ids_col].tolist() == [1, 1, 1]
+        assert partition.field_metadata["pv"].to_batch_schema([1, 2])["shape"] == (4,)
+        assert partition.field_metadata["pv"].global_indexes == {1, 2}
+        assert partition.field_custom_backend_meta[0] == {"ids": "i0"}
+        assert partition.global_indexes == {0, 1, 2}
+        assert partition.keys_mapping["a"] == 0
+        assert partition.custom_meta[0] == {"tag": "a"}
+        assert partition.consumption_status["task"].tolist() == [1, 1, 1]
+
+        nested = {"dtype": "torch.float32", "is_nested": True, "per_sample_shapes": {3: (3,), 4: (7,)}}
+        assert partition.update_production_status([3, 4], ["pv"], {"pv": nested})
+        assert partition.field_metadata["pv"].per_sample_shapes == {1: (4,), 2: (4,), 3: (3,), 4: (7,)}
+
+    def test_clear_fields_drops_fieldmeta_when_no_sample_holds_it(self):
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1], ["pv"], {"pv": t4})
+
+        partition.clear_fields([0, 1], ["pv", "missing"])
+
+        assert "pv" not in partition.field_metadata
+        assert partition.global_indexes == {0, 1}
+
+    def test_unfinalized_write_records_metadata_but_stays_hidden(self):
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1], ["pv"], {"pv": t4})
+
+        assert partition.update_production_status([1], ["pv"], {"pv": t4}, ready=False)
+        assert partition.field_metadata["pv"].global_indexes == {0, 1}
+        assert partition.scan_data_status(["pv"], task_name="trainer") == [0]
+
+        partition.update_production_status([1], ["pv"], {"pv": t4})
+        assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
+
+    def test_dtype_conflict_leaves_readiness_unchanged(self):
+        import pytest
+
+        partition = self._make_partition()
+        f32 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        i64 = {**f32, "dtype": "torch.int64"}
+        partition.update_production_status([0, 1], ["pv"], {"pv": f32})
+
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            partition.update_production_status([1], ["pv"], {"pv": i64}, ready=False)
+        assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
+        assert partition.field_metadata["pv"].dtype == "torch.float32"
+
     def test_update_production_status_updates_field_metadata(self):
         """Test that update_production_status correctly updates field_metadata via _update_field_metadata."""
         partition = self._make_partition()
@@ -1427,3 +1492,77 @@ class TestFieldMetaIntegration:
         schema = field_meta.to_batch_schema([0, 1])
 
         assert schema["per_sample_shapes"] == [(3,), None]
+
+
+def test_index_manager_balances_each_partition_across_storage_units():
+    """Alternating one-row allocations put every row of a partition on one unit before."""
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    manager.set_num_storage_units(2)
+    for _ in range(4):
+        manager.allocate_indexes("__public__", 1)
+        manager.allocate_indexes("train", 1)
+    for partition_id in ("__public__", "train"):
+        assert sorted(idx % 2 for idx in manager.partition_to_indexes[partition_id]) == [0, 0, 1, 1]
+
+    manager.release_indexes("train", [idx for idx in manager.partition_to_indexes["train"] if idx % 2 == 0])
+    manager.allocate_indexes("val", 3)
+    assert sorted(idx % 2 for idx in manager.partition_to_indexes["val"]) == [0, 0, 1]
+    assert manager.unit_loads["train"] == [0, 2]
+
+    reusable = manager.reusable_indexes
+    manager.set_num_storage_units(2, reusable)
+    assert sorted(manager.reusable_indexes) == sorted(reusable)
+    assert manager.unit_loads == {"__public__": [2, 2], "train": [0, 2], "val": [2, 1]}
+
+
+def test_index_manager_with_one_unit_reuses_fifo():
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    assert manager.allocate_indexes("p", 3) == [0, 1, 2]
+    manager.release_indexes("p", [2, 0])
+    assert manager.allocate_indexes("q", 3) == [2, 0, 3]
+
+
+class TestFieldLinks:
+    """Rows of a partition linking to a public row through DataPartitionStatus.link_fields."""
+
+    SCHEMA = {"x": {"dtype": "torch.int64", "shape": (3,), "is_nested": False, "is_non_tensor": False}}
+
+    def _public(self):
+        """Public row 0 holds ``x``."""
+        from transfer_queue.controller import PUBLIC_PARTITION, DataPartitionStatus
+
+        public = DataPartitionStatus(partition_id=PUBLIC_PARTITION)
+        assert public.update_production_status([0], ["x"], field_schema=self.SCHEMA)
+        return public
+
+    def test_source_index_follows_link_put_and_clear(self):
+        from transfer_queue.controller import DataPartitionStatus
+
+        public = self._public()
+        partition = DataPartitionStatus(partition_id="train")
+        partition.link_fields([1, 2], public, 0, ["x"])
+        assert partition.linked_by == {0: {1, 2}}
+        assert partition.field_metadata["x"].shape == (3,) and partition.production_status[[1, 2], 0].tolist() == [1, 1]
+        assert partition.linked_sources([0], ["x"]) == {0} and partition.linked_sources([0], ["y"]) == set()
+
+        assert partition.update_production_status([1], ["x"], field_schema=self.SCHEMA)
+        partition.clear_data([2])
+
+        assert partition.links == {} and partition.linked_by == {}
+        assert partition.linked_sources([0]) == set()
+
+    def test_checkpoint_saved_before_links_still_loads(self):
+        import pickle
+
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="old")
+        del partition.links, partition.linked_by
+        partition = pickle.loads(pickle.dumps(partition))
+
+        partition.link_fields([1], self._public(), 0, ["x"])
+        assert partition.linked_by == {0: {1}}

@@ -23,6 +23,7 @@ import zmq
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue import TransferQueueClient
+from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import (
@@ -1354,6 +1355,27 @@ def test_controller_rpc_reuses_one_socket(client_setup):
     assert len(mock_controller.caller_identities) == 1, "each request opened its own socket"
 
 
+def test_controller_rpc_raises_when_controller_never_replies():
+    """A lost controller reply must surface as an error, not block the caller forever."""
+    context = zmq.Context()
+    silent_controller = context.socket(zmq.ROUTER)
+    port = silent_controller.bind_to_random_port("tcp://127.0.0.1")
+    controller_info = ZMQServerInfo(
+        role=Role.CONTROLLER, id="silent_controller", ip="127.0.0.1", ports={"request_handle_socket": port}
+    )
+    with patch("transfer_queue.client.TQ_CONTROLLER_SEND_RECV_TIMEOUT", 1):
+        client = TransferQueueClient(client_id="client_timeout", controller_info=controller_info)
+    try:
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="Resource temporarily unavailable"):
+            client.get_partition_list()
+        assert time.monotonic() - start < 10
+    finally:
+        client.close()
+        silent_controller.close(linger=0)
+        context.term()
+
+
 # =====================================================
 # Checkpoint Interface Tests
 # =====================================================
@@ -1472,3 +1494,27 @@ class TestClientCheckpointInterface:
 
         with pytest.raises(RuntimeError, match="Storage manager not initialized"):
             client.load_storage_checkpoint(ckpt_dir)
+
+
+@pytest.mark.asyncio
+async def test_async_get_data_passes_data_parser_only_when_set():
+    """Custom managers written as get_data(self, metadata) keep serving plain gets."""
+
+    class OldStyleManager:
+        async def get_data(self, metadata):
+            return TensorDict({"x": torch.zeros(metadata.size)}, batch_size=[metadata.size])
+
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client.client_id = "old_manager_client"
+    client.storage_manager = OldStyleManager()
+    metadata = BatchMeta(
+        global_indexes=[0],
+        partition_ids=["0"],
+        field_schema={"x": {"dtype": torch.float32, "shape": (1,), "is_nested": False, "is_non_tensor": False}},
+    )
+
+    assert "x" in await client.async_get_data(metadata)
+    with pytest.raises(TypeError):
+        await client.async_get_data(metadata, data_parser=lambda data, args: data)
+    with pytest.raises(ValueError, match="parser_args requires data_parser"):
+        await client.async_get_data(metadata, parser_args=[1])

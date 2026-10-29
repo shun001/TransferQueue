@@ -19,6 +19,7 @@ import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import ExitStack
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
@@ -59,6 +60,32 @@ TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEM
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
 TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TIMEOUT", 10))
 
+# A selective dump or load sends one request per unit covering all of its rows, so its duration
+# grows with the selection and shared-filesystem speed rather than with a batch.
+TQ_SIMPLE_STORAGE_DUMP_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_DUMP_TIMEOUT", 3600))
+
+
+_SHAREABLE_PARSER_ARG_TYPES = (type(None), bool, int, float, str)
+
+
+def _parser_arg_identity(parser_arg: Any, pos: int) -> tuple:
+    """Return a key equal for two plain parser_args (scalars and lists of them) of equal type and value.
+
+    Any other argument, such as a tensor, gets one unique to batch position ``pos``: a linked
+    row is then parsed once per such key instead of being shared across keys.
+    """
+
+    def identity(value: Any) -> tuple | None:
+        if isinstance(value, _SHAREABLE_PARSER_ARG_TYPES):
+            return (type(value), value)
+        if isinstance(value, list | tuple):
+            items = [identity(item) for item in value]
+            return None if None in items else (type(value), tuple(items))
+        return None
+
+    key = identity(parser_arg)
+    return ("position", pos) if key is None else ("value", key)
+
 
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
@@ -88,6 +115,48 @@ def _describe_unit_state(body: dict[str, Any]) -> str:
     return f"verdict=unit_serving_again ({' '.join(parts)})"
 
 
+def _build_update_field_schema(
+    global_indexes: list[int],
+    per_unit: list[tuple[list[int], dict[str, dict[str, Any]]]],
+) -> dict[str, dict[str, Any]]:
+    """Assemble one batch-level field_schema from each unit's per-sample description.
+
+    A unit only describes its own rows, so shapes are collected per global index and
+    then ordered to match ``global_indexes``: the controller reads per_sample_shapes
+    positionally against the indexes it is notified about.
+    """
+    dtypes: dict[str, Any] = {}
+    shapes: dict[str, dict[int, tuple]] = defaultdict(dict)
+    non_tensor: set[str] = set()
+    for unit_indexes, described in per_unit:
+        for field_name, description in described.items():
+            unit_shapes = description["shapes"]
+            if unit_shapes is None:
+                non_tensor.add(field_name)
+                continue
+            dtypes[field_name] = description["dtype"]
+            # Serialization turns the unit's tuples into lists; shapes are compared and hashed here.
+            shapes[field_name].update(zip(unit_indexes, (tuple(s) for s in unit_shapes), strict=True))
+
+    field_schema: dict[str, dict[str, Any]] = {}
+    for field_name in non_tensor | set(shapes):
+        # A column is only a tensor column when every unit stored tensors for it.
+        if field_name in non_tensor:
+            field_schema[field_name] = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+            continue
+        ordered = [shapes[field_name][gi] for gi in global_indexes]
+        is_nested = len(set(ordered)) > 1
+        field_schema[field_name] = {
+            "dtype": dtypes[field_name],
+            "shape": None if is_nested else ordered[0],
+            "is_nested": is_nested,
+            "is_non_tensor": False,
+        }
+        if is_nested:
+            field_schema[field_name]["per_sample_shapes"] = ordered
+    return field_schema
+
+
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
 
@@ -102,6 +171,12 @@ with_storage_unit_socket = with_zmq_socket(
 with_storage_unit_probe_socket = with_zmq_socket(
     get_peer=lambda self, target: self.storage_unit_infos[target],
     get_pool=lambda self: self.storage_probe_pool,
+    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
+)
+
+with_storage_unit_dump_socket = with_zmq_socket(
+    get_peer=lambda self, target: self.storage_unit_infos[target],
+    get_pool=lambda self: self.storage_dump_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
 
@@ -141,6 +216,12 @@ class AsyncSimpleStorageManager(StorageManager):
             "put_get_socket",
             timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
             maxsize=1,
+        )
+        self.storage_dump_pool = ZMQSocketPool(
+            self.zmq_context,
+            f"{self.storage_manager_id}_dump",
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_DUMP_TIMEOUT,
         )
 
         self.config = config
@@ -487,6 +568,90 @@ class AsyncSimpleStorageManager(StorageManager):
             field_schema,
         )
 
+    async def update_data(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+        finalize: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """Merge or add values on each owner unit and notify the controller.
+
+        Each unit reports the values it stored; this assembles one batch-level
+        field_schema. ``finalize`` decides whether the fields become ready.
+        """
+        logger.debug(f"[{self.storage_manager_id}]: receive update_data request, updating {metadata.size} samples.")
+
+        if metadata.size == 0:
+            return {}
+        if values.batch_size[0] != metadata.size:
+            raise ValueError(
+                f"Batch size of values ({values.batch_size[0]}) does not match metadata size ({metadata.size})"
+            )
+        field_names = list(values.keys())
+
+        routing = self._group_by_hash(metadata.global_indexes)
+        tasks = []
+        for su_id, group in routing.items():
+            storage_data = {f: self._select_by_positions(values[f], group.batch_positions) for f in field_names}
+            unit_columns = {
+                f: {**merge_plan[f], "held": [merge_plan[f]["held"][p] for p in group.batch_positions]}
+                for f in field_names
+            }
+            tasks.append(
+                self._request_with_retry(
+                    "update",
+                    su_id,
+                    f"samples={len(group.global_indexes)} fields={field_names}",
+                    partial(
+                        self._update_to_single_storage_unit,
+                        group.global_indexes,
+                        storage_data,
+                        merge_fn,
+                        unit_columns,
+                        target_storage_unit=su_id,
+                    ),
+                    # A merge reads stored state, so a replay after a lost answer
+                    # could fold the same new value in twice.
+                    max_attempts=1,
+                )
+            )
+
+        try:
+            described = await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: update_data failed. "
+                f"partition_id={metadata.partition_ids[0]}, "
+                f"num_samples={metadata.size}, "
+                f"num_storage_units={len(routing)}, "
+                f"error={type(e).__name__}: {e}"
+            )
+            raise
+
+        field_schema = _build_update_field_schema(
+            metadata.global_indexes, list(zip([g.global_indexes for g in routing.values()], described, strict=True))
+        )
+
+        try:
+            published = await self.notify_data_update(
+                metadata.partition_ids[0],
+                metadata.global_indexes,
+                field_schema,
+                ready=finalize,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Storage update committed, but controller notification failed: {e}; do not retry this merge blindly"
+            ) from e
+        if not published:
+            raise RuntimeError(
+                "Storage update committed, but the controller did not accept its metadata; "
+                "do not retry this merge blindly"
+            )
+        return field_schema
+
     @with_storage_unit_socket
     async def _put_to_single_storage_unit(
         self,
@@ -533,6 +698,67 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"{target_storage_unit}: {type(e).__name__}: {e}"
             )
             raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+
+    @with_storage_unit_socket
+    async def _update_to_single_storage_unit(
+        self,
+        global_indexes: list[int],
+        storage_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Send an update to one storage unit and return what it stored, per field."""
+        body: dict[str, Any] = {
+            "global_indexes": global_indexes,
+            "data": storage_data,
+            "merge_fn": merge_fn,
+            "merge_plan": merge_plan,
+        }
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body=body,
+        )
+
+        serialized_bytes = 0
+        started = time.perf_counter()
+        try:
+            frames = request_msg.serialize()
+            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+            await socket.send_multipart(frames, copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+
+            if response_msg.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
+                raise RuntimeError(
+                    f"Failed to update data on storage unit {target_storage_unit}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+            log_heavy_operation(
+                self.storage_manager_id,
+                "update",
+                time.perf_counter() - started,
+                serialized_bytes,
+                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
+                f"samples={len(global_indexes)} fields={list(storage_data)}",
+            )
+            return response_msg.body.get("stored_shapes", {})
+        except zmq.error.Again as e:
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during update to storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
+                f"serialized_mb={serialized_bytes / 2**20:.1f}"
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: Unexpected error during update to storage unit "
+                f"{target_storage_unit}: {type(e).__name__}: {e}"
+            )
+            raise RuntimeError(f"Error in update to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -584,14 +810,25 @@ class AsyncSimpleStorageManager(StorageManager):
             # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
         return NonTensorStack(*values)
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Retrieve data from remote StorageUnit based on metadata.
 
-        Routes to each SU using global_idx % num_su (hash routing).
+        Routes to each SU using global_idx % num_su (hash routing). A linked field is read
+        from its source row, once however many samples link to it, or with ``parser_args`` once
+        per distinct plain parser_arg of those samples.
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
+            data_parser: Optional ``data_parser(data, args)`` each SU applies to its part of the
+                batch before replying. See ``transfer_queue.kv_batch_get``.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``;
+                each SU receives the slice for its samples as ``args``.
 
         Returns:
             TensorDict containing the retrieved data.
@@ -602,21 +839,61 @@ class AsyncSimpleStorageManager(StorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        routing = self._group_by_hash(metadata.global_indexes)
+        # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
+        max_attempts = 1 if data_parser is not None else None
+
+        # A unit request reads the same fields for every row in it, so rows are grouped by the
+        # fields read from them: a sample's own fields once per occurrence, so repeated keys
+        # keep their parser_args, and the fields it links to one source row together, once per
+        # source, field set and parser_arg however many link to it. The source's unit then
+        # parses those fields in one call and replies with the parsed part only.
+        rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        args_by_fields: dict[tuple[str, ...], list[Any]] = defaultdict(list)
+        slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (sample, field) -> (fields, row)
+        linked_slots: dict[tuple, tuple[tuple[str, ...], int]] = {}  # (source, fields, arg) -> slot
+        for pos, (global_index, links) in enumerate(zip(metadata.global_indexes, metadata._links, strict=True)):
+            parser_arg = None if parser_args is None else parser_args[pos]
+            own = tuple(f for f in metadata.field_names if f not in links)
+            if own:
+                slots.update({(pos, f): (own, len(rows_by_fields[own])) for f in own})
+                rows_by_fields[own].append(global_index)
+                args_by_fields[own].append(parser_arg)
+            fields_by_source: dict[int, list[str]] = defaultdict(list)
+            for field in metadata.field_names:
+                if field in links:
+                    fields_by_source[links[field]].append(field)
+            for source, source_fields in fields_by_source.items():
+                fields = tuple(source_fields)
+                linked = (source, fields, _parser_arg_identity(parser_arg, pos))
+                if linked not in linked_slots:
+                    linked_slots[linked] = (fields, len(rows_by_fields[fields]))
+                    rows_by_fields[fields].append(source)
+                    args_by_fields[fields].append(parser_arg)
+                slots.update({(pos, f): linked_slots[linked] for f in fields})
+        requests = [
+            (su_id, fields, group)
+            for fields, rows in rows_by_fields.items()
+            for su_id, group in self._group_by_hash(rows).items()
+        ]
 
         tasks = [
             self._request_with_retry(
                 "get",
                 su_id,
-                f"samples={len(group.global_indexes)} fields={list(metadata.field_names)}",
+                f"samples={len(group.global_indexes)} fields={list(fields)}",
                 partial(
                     self._get_from_single_storage_unit,
                     group.global_indexes,
-                    metadata.field_names,
+                    list(fields),
                     target_storage_unit=su_id,
+                    data_parser=data_parser,
+                    parser_args=None
+                    if parser_args is None
+                    else [args_by_fields[fields][p] for p in group.batch_positions],
                 ),
+                max_attempts=max_attempts,
             )
-            for su_id, group in routing.items()
+            for su_id, fields, group in requests
         ]
         try:
             results = await asyncio.gather(*tasks)
@@ -628,19 +905,19 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: get_data failed. "
                 f"partition_id={metadata.partition_ids[0]}, "
                 f"num_samples={metadata.size}, "
-                f"num_storage_units={len(routing)}, "
+                f"num_requests={len(requests)}, "
                 f"error={type(e).__name__}: {e}"
             )
             raise
 
-        # Scatter results directly to batch positions — no intermediate per-sample dict
-        n = len(metadata.global_indexes)
-        ordered_data: dict[str, list] = {field: [None] * n for field in metadata.field_names}
-
-        for (su_id, group), (fields, su_data) in zip(routing.items(), results, strict=True):
+        values: dict[tuple[tuple[tuple[str, ...], int], str], Any] = {}
+        for (_, fields, group), (_, su_data) in zip(requests, results, strict=True):
             for field in fields:
-                for i, pos in enumerate(group.batch_positions):
-                    ordered_data[field][pos] = su_data[field][i]
+                for i, row in enumerate(group.batch_positions):
+                    values[(fields, row), field] = su_data[field][i]
+        ordered_data = {
+            field: [values[slots[pos, field], field] for pos in range(metadata.size)] for field in metadata.field_names
+        }
 
         tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
 
@@ -652,6 +929,8 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
@@ -680,13 +959,14 @@ class AsyncSimpleStorageManager(StorageManager):
             ) from exc
         return fields, data
 
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
 
         Routes to each SU using global_idx % num_su (hash routing).
 
         Args:
             metadata: BatchMeta that contains metadata for data clearing.
+            fields: If given, delete only these fields and keep the samples.
         """
 
         logger.debug(f"[{self.storage_manager_id}]: receive clear_data request, clearing {metadata.size} samples.")
@@ -697,39 +977,39 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._clear_single_storage_unit(group.global_indexes, target_storage_unit=su_id)
+            self._clear_single_storage_unit(group.global_indexes, fields=fields, target_storage_unit=su_id)
             for su_id, group in routing.items()
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for i, result in enumerate(results):
+        # Logged rather than raised: the caller no longer wants this data, and failing its cleanup
+        # would stop the job. The unit keeps the payloads until their indexes are reused and cleared.
+        for (su_id, group), result in zip(routing.items(), results, strict=True):
             if isinstance(result, Exception):
-                logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
-
-    @with_storage_unit_socket
-    async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
-        try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA,
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"global_indexes": global_indexes},
-            )
-
-            await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to clear storage {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
+                logger.error(
+                    f"[{self.storage_manager_id}]: Failed to clear {len(group.global_indexes)} samples "
+                    f"(fields={fields or 'all'}) on storage unit {su_id}; they stay in its memory: "
+                    f"{type(result).__name__}: {result}"
                 )
 
-        except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Error clearing storage unit {target_storage_unit}: {str(e)}")
-            raise
+    @with_storage_unit_socket
+    async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.CLEAR_DATA,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={"global_indexes": global_indexes, "fields": fields},
+        )
+
+        await socket.send_multipart(request_msg.serialize())
+        messages = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(messages)
+
+        if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
+            raise RuntimeError(
+                f"Failed to clear storage {target_storage_unit}: {response_msg.body.get('message', 'Unknown error')}"
+            )
 
     def get_zmq_server_info(self) -> dict[str, ZMQServerInfo]:
         """Get ZMQ server information for all storage units.
@@ -799,6 +1079,177 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
 
+    @with_storage_unit_dump_socket
+    async def _dump_single_shard(
+        self,
+        path: str,
+        target_storage_unit: str,
+        fields_by_index: dict[int, list[str]],
+        socket: zmq.Socket = None,
+    ) -> dict[str, Any]:
+        """Ask one storage unit to write the rows it owns into a shard file."""
+        try:
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={"path": path, "fields_by_index": fields_by_index},
+            )
+            await socket.send_multipart(request_msg.serialize(), copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+            if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get("success"):
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
+                    f"{response_msg.body.get('message', 'unknown error')}"
+                )
+            missing_rows = response_msg.body["missing_rows"]
+            if missing_rows:
+                # The controller reported these rows as produced, so a unit that has no
+                # data for them means the two disagree. Never write a half table.
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
+                )
+            return response_msg.body
+        except Exception as e:
+            raise RuntimeError(
+                f"[{self.storage_manager_id}]: Error dumping shard from storage unit {target_storage_unit}: {str(e)}"
+            ) from e
+
+    async def dump_rows_by_index(
+        self,
+        shard_dir: str,
+        fields_by_index: dict[int, list[str]],
+    ) -> dict[str, Any]:
+        """Dump the given rows into one shard per storage unit, in parallel.
+
+        Each unit pickles its own rows in its own process, so the payload never passes
+        through the caller. A unit that owns none of the rows is skipped rather than
+        writing an empty shard.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one ``{"file", "storage_unit_id", "rows",
+            "row_offsets"}`` entry per written shard, and each dumped row's
+            ``{field: (dtype, shape) or None}`` as the owner unit holds it.
+
+        Raises:
+            RuntimeError: A unit holds no data for a row it was asked to dump.
+        """
+        shard_dir_path = Path(shard_dir)
+        shard_dir_path.mkdir(parents=True, exist_ok=True)
+
+        routing = self._group_by_hash(sorted(fields_by_index))
+        targets = [(su_id, group.global_indexes) for su_id, group in routing.items()]
+        paths = [str(shard_dir_path / f"shard_{pos}_{su_id}.pkl") for pos, (su_id, _) in enumerate(targets)]
+
+        results = await asyncio.gather(
+            *(
+                self._dump_single_shard(
+                    path,
+                    target_storage_unit=su_id,
+                    fields_by_index={index: fields_by_index[index] for index in indexes},
+                )
+                for path, (su_id, indexes) in zip(paths, targets, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        shards = []
+        row_schema = {}
+        total_rows = 0
+        for path, (su_id, _), result in zip(paths, targets, results, strict=True):
+            if isinstance(result, BaseException):
+                raise result
+            offsets = result["row_offsets"]
+            total_rows += len(offsets)
+            row_schema.update(result["row_schema"])
+            shards.append(
+                {
+                    "file": Path(path).name,
+                    "storage_unit_id": su_id,
+                    "rows": len(offsets),
+                    "row_offsets": offsets,
+                }
+            )
+
+        logger.info(
+            f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"
+        )
+        return {"shards": shards, "row_schema": row_schema}
+
+    async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
+        """Have current owner units read assigned byte ranges concurrently, then publish metadata.
+
+        Metadata is published only after every unit succeeded, so writes to new keys stay
+        invisible after a failure, while fields existing keys already produced are
+        overwritten in place. Retrying rewrites the same target indexes.
+
+        Returns:
+            Payload bytes read by the units.
+        """
+        assignments = defaultdict(list)
+        for shard in shards:
+            rows = shard["records"]
+            for unit_id, group in self._group_by_hash([row["target_index"] for row in rows]).items():
+                assignments[unit_id].append(
+                    {
+                        **shard,
+                        "records": [rows[pos] for pos in group.batch_positions],
+                    }
+                )
+        results = await asyncio.gather(
+            *(self._load_selected_rows(shards, target_storage_unit=unit_id) for unit_id, shards in assignments.items()),
+            return_exceptions=True,
+        )
+        loaded = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            loaded.append(result)
+        # One update per (shard, unit, batch, field set): sequential round trips would
+        # dominate a wide cross-topology load. The notify pool bounds the concurrency.
+        await asyncio.gather(
+            *(
+                self.notify_data_update(
+                    partition_id, update["global_indexes"], update["field_schema"], ready=update["ready"]
+                )
+                for result in loaded
+                for update in result["updates"]
+            )
+        )
+        bytes_read = sum(result["bytes_read"] for result in loaded)
+        logger.info(
+            "[%s]: loaded %s bytes across %s units",
+            self.storage_manager_id,
+            bytes_read,
+            len(assignments),
+        )
+        return bytes_read
+
+    @with_storage_unit_dump_socket
+    async def _load_selected_rows(
+        self,
+        shards: list[dict[str, Any]],
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ) -> dict[str, Any]:
+        request = ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_ROWS,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={"shards": shards},
+        )
+        await socket.send_multipart(request.serialize(), copy=False)
+        response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+        if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
+            raise RuntimeError(
+                f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
+            )
+        return response.body
+
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
 
@@ -858,19 +1309,10 @@ class AsyncSimpleStorageManager(StorageManager):
         """Close payload transfer and pooled sockets before ZMQ ownership is released."""
         # Before super(), which may destroy the context these live on. getattr guards the
         # base-constructor-raised case (a failed handshake does), and __del__ still calls this.
-        transfer = getattr(self, "payload_transfer", None)
-        pool = getattr(self, "storage_rpc_pool", None)
-        probe_pool = getattr(self, "storage_probe_pool", None)
-        try:
-            if transfer is not None:
-                transfer.close()
-        finally:
-            try:
-                if pool is not None:
-                    pool.close()
-            finally:
-                try:
-                    if probe_pool is not None:
-                        probe_pool.close()
-                finally:
-                    super().close()
+        with ExitStack() as stack:
+            for name in ("payload_transfer", "storage_rpc_pool", "storage_probe_pool", "storage_dump_pool"):
+                resource = getattr(self, name, None)
+                if resource is not None:
+                    stack.callback(resource.close)
+            # All close operations have been registered and will be executed in LIFO order.
+            super().close()

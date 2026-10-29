@@ -190,9 +190,13 @@ prevented every drop in that window.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `tq_storage_request_duration_seconds` | Histogram | `op_type` | Request latency (buckets: 1ms–5s) |
-| `tq_storage_request_total` | Counter | `op_type` | Total requests processed |
+| `tq_storage_request_total` | Counter | `op_type` | Requests whose handler has started |
 | `tq_storage_request_errors_total` | Counter | `op_type` | Total request errors |
 | `tq_storage_request_samples_total` | Counter | `op_type` | Total samples processed per operation |
+
+This endpoint is served by its own thread rather than the worker, so `tq_storage_request_total`
+minus `tq_storage_request_duration_seconds_count` (observed when a handler returns or raises)
+gives the handlers still running, even while the worker is stuck.
 
 > **Note on naming**: The ZMQ-collected gauges on the controller avoid all Prometheus reserved suffixes (`_total`, `_bucket`, `_sum`, `_count`, `_info`, `_created`) and the reserved `le` label to prevent type metadata conflicts that break `label_values()` queries. P50/P99 are computed on the storage unit side and sent as pre-calculated values. The storage unit's own endpoint uses standard Counter/Histogram naming conventions.
 

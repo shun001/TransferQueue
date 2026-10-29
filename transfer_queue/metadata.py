@@ -202,6 +202,7 @@ class BatchMeta:
         extra_info: Additional batch-level information.
         custom_meta: Per-sample user-defined metadata, list aligned with global_indexes.
         _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
+        _links: Per-sample {field: source global_index} for linked fields, list aligned with global_indexes.
     """
 
     __slots__ = (
@@ -215,6 +216,7 @@ class BatchMeta:
         "_size",
         "_field_names",
         "_is_ready",
+        "_links",
     )
 
     def __init__(
@@ -226,6 +228,7 @@ class BatchMeta:
         extra_info: dict[str, Any] | None = None,
         custom_meta: list[dict[str, Any]] | None = None,
         _custom_backend_meta: list[dict[str, Any]] | None = None,
+        _links: list[dict[str, int]] | None = None,
     ) -> None:
         if field_schema is None:
             field_schema = {}
@@ -288,6 +291,12 @@ class BatchMeta:
                 raise ValueError(
                     f"_custom_backend_meta length {len(self._custom_backend_meta)} != batch_size {batch_size}"
                 )
+        if not _links:
+            self._links: list[dict[str, int]] = [{} for _ in range(batch_size)]
+        else:
+            self._links = [dict(d) for d in _links]
+            if len(self._links) != batch_size:
+                raise ValueError(f"_links length {len(self._links)} != batch_size {batch_size}")
 
     def __getstate__(self):
         """Serialize for pickle/Ray.
@@ -461,10 +470,24 @@ class BatchMeta:
         if batch_size != self.size:
             raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")
 
-        field_schema = extract_field_schema(tensor_dict)
+        return self.apply_field_schema(extract_field_schema(tensor_dict), set_all_ready=set_all_ready)
 
-        for key, value in field_schema.items():
-            self.field_schema[key] = value
+    def apply_field_schema(self, field_schema: dict[str, dict[str, Any]], set_all_ready: bool = True) -> "BatchMeta":
+        """Merge a field_schema into this batch in place.
+
+        The only place that keeps ``field_names`` and ``is_ready`` in step with
+        ``field_schema`` and ``production_status``; callers holding a schema from storage
+        should go through here rather than writing the derived state themselves.
+
+        Args:
+            field_schema: Per-field metadata to add or overwrite.
+            set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME. Default is True.
+        """
+        self.field_schema.update(field_schema)
+        # The written values replace links on these fields, as they do in the controller.
+        for links in self._links:
+            for name in field_schema:
+                links.pop(name, None)
 
         if set_all_ready:
             self.production_status[:] = 1
@@ -513,6 +536,7 @@ class BatchMeta:
             extra_info=self.extra_info,
             custom_meta=new_custom_meta,
             _custom_backend_meta=new_custom_backend_meta,
+            _links=[self._links[i] for i in sample_indices],
         )
 
     def select_fields(self, field_names: list[str]) -> "BatchMeta":
@@ -524,6 +548,10 @@ class BatchMeta:
 
         Returns:
             BatchMeta: A new BatchMeta instance containing only the specified fields.
+
+        Note:
+            This filters only this local metadata, links included; it neither unlinks fields on the
+            controller nor selects the data a put writes. Select those fields from the data too.
         """
         new_field_schema = {}
         for field_name in field_names:
@@ -542,6 +570,7 @@ class BatchMeta:
             extra_info=copy.deepcopy(self.extra_info),
             custom_meta=copy.deepcopy(self.custom_meta),
             _custom_backend_meta=selected_custom_backend_meta,
+            _links=[{f: s for f, s in m.items() if f in field_names} for m in self._links],
         )
 
     def copy(self) -> "BatchMeta":
@@ -554,6 +583,7 @@ class BatchMeta:
             extra_info=copy.deepcopy(self.extra_info),
             custom_meta=copy.deepcopy(self.custom_meta),
             _custom_backend_meta=copy.deepcopy(self._custom_backend_meta),
+            _links=self._links,
         )
 
     def __len__(self) -> int:
@@ -691,6 +721,10 @@ class BatchMeta:
             extra_info=merged_extra_info,
             custom_meta=merged_custom_meta,
             _custom_backend_meta=merged_custom_backend_meta,
+            _links=[
+                {**{f: s for f, s in mine.items() if f not in other.field_schema}, **theirs}
+                for mine, theirs in zip(self._links, other._links, strict=True)
+            ],
         )
 
     @classmethod
@@ -816,6 +850,7 @@ class BatchMeta:
             extra_info=merged_extra_info,
             custom_meta=all_custom_meta,
             _custom_backend_meta=all_custom_backend_meta,
+            _links=[links for chunk in data for links in chunk._links],
         )
 
     def reorder(self, indices: list[int]):
@@ -842,6 +877,7 @@ class BatchMeta:
 
         self.custom_meta = [self.custom_meta[i] for i in indices]
         self._custom_backend_meta = [self._custom_backend_meta[i] for i in indices]
+        self._links = [self._links[i] for i in indices]
 
     @classmethod
     def empty(cls, extra_info: dict[str, Any] | None = None) -> "BatchMeta":

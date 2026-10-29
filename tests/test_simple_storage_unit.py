@@ -29,6 +29,7 @@
 # limitations under the License.
 
 import gc
+import errno
 import pickle
 import time
 import weakref
@@ -47,9 +48,18 @@ from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     SSDFileStore,
     StorageKeyNotFoundError,
+    _apply_data_parser,
     _SSDValueRef,
 )
-from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, pack_into, unpack_from
+from transfer_queue.utils.serial_utils import (
+    calc_packed_size,
+    decode,
+    encode,
+    pack_into,
+    unpack_from,
+    MsgpackDecoder,
+    MsgpackEncoder,
+)
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -83,11 +93,14 @@ class MockStorageClient:
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
-    def send_get(self, client_id, global_indexes, fields):
+    def send_get(self, client_id, global_indexes, fields, data_parser=None, parser_args=None):
+        body = {"global_indexes": global_indexes, "fields": fields}
+        if data_parser is not None:
+            body.update(data_parser=data_parser, parser_args=parser_args)
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"global_indexes": global_indexes, "fields": fields},
+            body=body,
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
@@ -474,6 +487,12 @@ def test_storage_unit_data_direct():
     assert 0 not in storage_data.field_data["log_probs"]  # key gone
     assert 1 in storage_data.field_data["log_probs"]  # other key intact
 
+    # field-level clear keeps the sample and its other fields
+    storage_data.clear([1], fields=["rewards", "missing"])
+    assert 1 not in storage_data.field_data["rewards"]
+    assert 1 in storage_data.field_data["log_probs"]
+    assert storage_data._active_keys == {1}
+
 
 def test_storage_unit_data_capacity_uses_active_keys():
     """Capacity check must use _active_keys, not scan field_data."""
@@ -611,6 +630,31 @@ def test_hybrid_encoding_fallback_keeps_large_tensor_without_cloning(tmp_path, m
         storage.close()
 
 
+def test_hybrid_storage_field_clear_unlinks_only_that_field(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data({"pixel_values": [b"p" * 100], "ids": [b"i" * 100]}, [1])
+        assert storage.ssd_active_values == 2
+
+        storage.clear([1], fields=["pixel_values"])
+
+        assert storage.ssd_active_values == 1
+        assert storage.ssd_active_bytes == 100
+        assert len(list(tmp_path.rglob("*.bin"))) == 1
+        assert storage.active_key_count == 1
+        assert storage.get_data(["ids"], [1]) == {"ids": [b"i" * 100]}
+        with pytest.raises(StorageKeyNotFoundError):
+            storage.get_data(["pixel_values"], [1])
+    finally:
+        storage.close()
+
+
 def test_hybrid_storage_cleans_completed_ssd_writes_after_batch_failure(tmp_path, monkeypatch):
     """A failed SSD batch removes files written by its successful tasks."""
     storage = HybridStorageUnitData(
@@ -666,6 +710,39 @@ def test_failed_ssd_overwrite_preserves_old_value(tmp_path, monkeypatch):
         assert storage._ssd_active_bytes == len(old_value)
         assert old_path.exists()
         assert list(tmp_path.rglob("*.bin")) == [old_path]
+    finally:
+        storage.close()
+
+
+def test_failed_ssd_write_on_second_field_leaves_every_field_unchanged(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data({"a": [b"a" * 100], "b": [b"b" * 100]}, [1])
+        old_files = set(tmp_path.rglob("*.bin"))
+
+        write_values = storage._ssd_store.write_values
+        calls = []
+
+        def fail_second_field(encoded_values):
+            calls.append(encoded_values)
+            if len(calls) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write_values(encoded_values)
+
+        monkeypatch.setattr(storage._ssd_store, "write_values", fail_second_field)
+        with pytest.raises(OSError, match="No space left"):
+            storage.put_data({"a": [b"A" * 100], "b": [b"B" * 100]}, [1])
+
+        assert storage.get_data(["a", "b"], [1]) == {"a": [b"a" * 100], "b": [b"b" * 100]}
+        assert set(tmp_path.rglob("*.bin")) == old_files
+        assert storage.ssd_active_values == 2
+        assert storage.ssd_active_bytes == 200
     finally:
         storage.close()
 
@@ -962,6 +1039,59 @@ def test_storage_unit_data_parser_callable_types(storage_setup):
     client.close()
 
 
+def test_storage_unit_get_data_parser_parses_each_field_without_changing_stored_values(storage_setup):
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
+    tokens = torch.arange(8).reshape(2, 4)
+    images = [["i0", "i1", "i2"], ["j0", "j1"]]
+    response = client.send_put(0, [0, 1], {"tokens": tokens, "images": images})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE, response.body
+
+    def pick(data, args):
+        data["tokens"] = [value[:n] for value, (n, _) in zip(data["tokens"], args, strict=True)]
+        data["images"] = [[value[i] for i in idx] for value, (_, idx) in zip(data["images"], args, strict=True)]
+        return data
+
+    response = client.send_get(0, [1, 0], ["tokens", "images"], data_parser=pick, parser_args=[(1, [1]), (3, [2, 0])])
+    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE, response.body
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[1, :1], tokens[0, :3]])
+    assert response.body["data"]["images"] == [["j1"], ["i2", "i0"]]
+
+    response = client.send_get(0, [0, 1], ["tokens", "images"])
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[0], tokens[1]])
+    assert response.body["data"]["images"] == images
+
+    def drop_one(data, _args):
+        data["tokens"] = data["tokens"][:-1]
+        return data
+
+    response = client.send_get(0, [0, 1], ["tokens"], data_parser=drop_one)
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "data_parser changed the number of elements" in response.body["message"]
+
+    def unencodable(data, _args):
+        data["tokens"] = [(x for x in ()) for _ in data["tokens"]]
+        return data
+
+    response = client.send_get(0, [0, 1], ["tokens"], data_parser=unencodable)
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "failed to serialize response" in response.body["message"]
+    response = client.send_get(0, [0], ["tokens"])
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[0]])
+
+    client.close()
+
+
+def test_get_data_parser_view_sends_only_the_parsed_bytes():
+    value = torch.arange(12, dtype=torch.int64).view(3, 4)
+    parsed = _apply_data_parser({"x": [value]}, lambda data, _args: {"x": [v[:2] for v in data["x"]]}, None)
+
+    buffers = MsgpackEncoder().encode(parsed)
+    assert parsed["x"][0].data_ptr() == value.data_ptr()
+    assert buffers[1].nbytes == value[:2].nbytes < value.nbytes
+    assert torch.equal(MsgpackDecoder().decode(buffers)["x"][0], value[:2])
+
+
 def test_storage_unit_data_parser_validation(storage_setup):
     """Test that invalid data_parser inputs produce clear error messages."""
     _, put_get_address, storage_ip = storage_setup
@@ -1172,3 +1302,33 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
     client.close()
+
+
+def test_worker_survives_a_reply_failing_between_frames():
+    """A reply that fails mid-message must neither end the only worker nor misroute the next reply."""
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    process_request = unit._process_one_worker_request
+    failed = []
+
+    def fail_after_identity_frame(worker_socket, monitor):
+        if not failed:
+            failed.append(True)
+            identity = worker_socket.recv_multipart()[0]
+            worker_socket.send(identity, zmq.SNDMORE)
+            raise MemoryError
+        process_request(worker_socket, monitor)
+
+    unit._process_one_worker_request = fail_after_identity_frame
+    address, ip = unit.zmq_server_info.to_addr("put_get_socket"), unit.zmq_server_info.ip
+    stranded, next_client = MockStorageClient(address, ip), MockStorageClient(address, ip)
+    stranded.socket.setsockopt(zmq.RCVTIMEO, 1000)
+    try:
+        with pytest.raises(zmq.Again):
+            stranded.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+        response = next_client.send_put(1, [1], {"val": [torch.tensor([2.0])]})
+        assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        assert not stranded.socket.poll(500), "the next reply was routed to the stranded caller"
+    finally:
+        stranded.close()
+        next_client.close()
+        unit.shutdown()

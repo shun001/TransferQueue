@@ -72,9 +72,9 @@ In the data plane, we utilize a pluggable design, enabling TransferQueue to inte
 
 Specifically, we provide a `StorageManager` abstraction class that defines the core APIs as follows:
 
-- `async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None`
-- `async def get_data(self, metadata: BatchMeta) -> TensorDict`
-- `async def clear_data(self, metadata: BatchMeta) -> None`
+- `async def put_data(self, data: TensorDict, metadata: BatchMeta, data_parser=None) -> None`
+- `async def get_data(self, metadata: BatchMeta, data_parser=None, parser_args=None) -> TensorDict`
+- `async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None`
 
 This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.
 
@@ -115,9 +115,39 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
-- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
+- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields) and, on SimpleStorage, an optional `data_parser` run on the storage units.
+- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into fields with `merge_fn(old, new)`, adding missing keys and fields. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
-- **(async_)kv_clear**: Remove key-value pairs from storage.
+- **(async_)kv_describe**: Show each key's stored fields, including those `kv_update(finalize=False)` keeps hidden.
+- **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
+
+`kv_update` merges only the rows the controller records as holding the field
+(including hidden ones); every other row takes the new value as given, without
+calling `merge_fn`, and overwrites anything a storage unit kept after a failed
+clear. Every stored value must keep the field's tensor/non-tensor type and
+tensor dtype in the partition. A timeout has an unknown outcome because a
+storage unit may commit after the caller stops waiting, so non-idempotent merge
+operations must not be retried blindly. Updates are atomic within one
+storage-unit request; a batch spanning multiple units is not a distributed
+transaction.
+
+To build a field over several updates without exposing intermediate values, pass
+`finalize=False` to every `kv_update` except the last one, which uses the default
+`finalize=True`. Until then the field is stored but not ready, so samplers, the
+dataloader and `kv_batch_get` do not see it. Updates to one key must come from
+one writer at a time; use `kv_global_lock` if several processes write the same key.
+
+**Advanced: parsing on get.** Like `kv_batch_put`, `kv_batch_get` takes a
+`data_parser`, here run by each SimpleStorage unit before it replies, so only the
+parsed values cross the network (e.g. trimming padding or picking a few frames).
+It is called as `data_parser(data, args)`: `data` maps each selected field to the
+unit's stored values, one per sample, and `args` holds the matching entries of the
+optional per-key `parser_args`. Each field may be parsed differently, but the
+result must keep the keys and the number and order of values. `data` holds the
+stored objects themselves, so never modify them in place; build new values
+instead. As with put, a get with a parser is not retried on a storage-unit
+timeout; the call raises, and retrying it yourself may run the parser again, so
+keep it free of side effects. See the `kv_batch_get` docstring for details.
 
 **Key Features**
 
@@ -128,6 +158,33 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **Pluggable Backends**: Supports multiple backends.
 
 Refer to [tutorials/basic.ipynb](https://github.com/Ascend/TransferQueue/blob/main/tutorial/basic.ipynb) and [tutorials/02_kv_interface.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/02_kv_interface.py) for detailed usage examples.
+
+**KV Key Locks**
+
+Locks are **advisory**: KV calls never check them, so every writer that needs mutual exclusion must take the lock. `(async_)kv_local_lock` excludes threads and asyncio tasks of one process and needs no setup.
+
+- **(async_)kv_global_lock(keys, partition_id, timeout=None, lease_s=30)**: Hold an exclusive cluster-wide lock on `(partition_id, key)` pairs under a lease that a background thread renews. Yields a **GlobalLease**: call `check()` right before writes (it raises **LockLostError** once the lease is lost); `names` lists the locked pairs. Exiting the block also raises `LockLostError` if the lease was lost.
+- **kv_lock_list(partition_id=None)**: Return `{"holders": [...], "waiters": n}` for live global locks.
+
+```python
+import os
+os.environ["TQ_ENABLE_KV_GLOBAL_LOCK"] = "1"  # only in the process that creates TransferQueue, before tq.init()
+tq.init()
+with tq.kv_global_lock(["a", "b"], "train", timeout=30) as lease:
+    lease.check()
+    tq.kv_put("a", "train", fields={"v": torch.tensor([1])})
+```
+
+- **Enabling**: set these before `tq.init()` in the process that creates TransferQueue; only that process reads them. Processes and Ray workers that attach find the lock actors by name and need nothing. Without the switch, `kv_global_lock` raises `RuntimeError`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TQ_ENABLE_KV_GLOBAL_LOCK` | off | `1`/`true`/`yes`/`y`/`on` starts the lock actors |
+| `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` | `8` | Number of lock actors (integer >= 1) |
+| `TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES` | `10000` | Acquire calls each lock actor lets wait at once (integer >= 1) |
+
+- **Shards**: keys are spread by hash over `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` `TransferQueueLockManager` actors, which `tq.init()` pins round-robin to the alive Ray nodes (per-node counts differ by at most 1). Keys on several actors are taken one actor at a time, so a multi-key request may hold some keys while it waits for others.
+- **Capacity**: `TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES` caps the acquire calls each actor lets wait at once. A request past the cap keeps its queue place but polls once per window (5 s, or `lease_s / 3` if shorter), so it may see its grant up to a window late. About `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` × this value (80,000 by default) requests can wait without that delay. More shards spread the load, but all waiters on one key share one actor, so a hot key is bounded by this value alone. Each actor's Ray `max_concurrency` is this value plus 16 reserved slots shared, without priority, by renew, release, `kv_lock_list` and turned-away acquires. Every waiter still costs one call per window: past an actor's call throughput, renewals are delayed and leases can be lost.
 
 #### StreamingDataLoader API
 

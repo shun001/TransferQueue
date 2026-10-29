@@ -33,9 +33,11 @@ import os
 import shutil
 import subprocess
 import time
+from collections import Counter, defaultdict
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import ray
 import torch
@@ -43,8 +45,10 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
+from transfer_queue import data_dump
 from transfer_queue.client import TransferQueueClient
-from transfer_queue.controller import TransferQueueController
+from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
+from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
@@ -59,6 +63,9 @@ logger = get_logger(__name__)
 _TQ_CLIENT: Any = None
 _TQ_STORAGE: Any = None
 _TQ_CONTROLLER: Any = None
+# True only in the process whose init() created the controller. Other processes
+# attach to the same named actor, so their close() must not tear it down.
+_TQ_IS_OWNER = False
 
 # Idle workers and proxies observe shutdown within one second; leave time for
 # Ray dispatch, in-flight work, and SSD cleanup before forcing termination.
@@ -147,7 +154,8 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     It should be called once at the beginning of the program before any data operations.
 
     If a controller already exists, reuse it and only initialize the client;
-    the provided `conf` will be ignored in this case.
+    the provided `conf` will be ignored in this case. Only the process that
+    created the controller tears TransferQueue down in `close()`.
 
     Args:
         conf: Optional custom config merged with default `config.yaml`.
@@ -194,13 +202,16 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             sampler = globals()[final_conf.controller.sampler]
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
+    lock_settings = _lock_settings()
 
     try:
-        global _TQ_CONTROLLER
+        global _TQ_CONTROLLER, _TQ_IS_OWNER
         _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace="transfer_queue"
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
+        _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
+        _start_lock_managers(lock_settings)
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
@@ -241,10 +252,10 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
 def close():
     """Close the TransferQueue system.
 
-    This function cleans up the TransferQueue system, including:
-    - Closing the client and its associated resources
-    - Cleaning up distributed storage (only for the process that initialized it)
-    - Killing the controller actor
+    Every process closes its client and drops its handles. Only the process whose
+    `init()` created TransferQueue also cleans up distributed storage and kills the
+    controller and lock actors; processes that attached leave them running, release
+    their own `kv_global_lock` leases, and may `init()` again.
 
     Note:
         This function should be called when the TransferQueue system is no longer needed.
@@ -252,6 +263,7 @@ def close():
     global _TQ_CLIENT
     global _TQ_STORAGE
     global _TQ_CONTROLLER
+    global _TQ_IS_OWNER
 
     try:
         if _TQ_STORAGE:
@@ -311,12 +323,14 @@ def close():
         _TQ_CLIENT.close()
         _TQ_CLIENT = None
 
-    if _TQ_CONTROLLER:
+    _close_lock_managers()
+    if _TQ_IS_OWNER:
         try:
             ray.kill(_TQ_CONTROLLER)
         except Exception:
             pass
-        _TQ_CONTROLLER = None
+    _TQ_CONTROLLER = None
+    _TQ_IS_OWNER = False
 
 
 # ==================== Metrics API ====================
@@ -385,6 +399,8 @@ def kv_put(
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -443,7 +459,10 @@ def kv_batch_put(
         ValueError: When both ``fields`` and ``tags`` are empty.
         ValueError: When ``fields`` batch size mismatches key count.
         ValueError: When ``tags`` length mismatches key count.
+        ValueError: When ``keys`` contains duplicates.
         RuntimeError: When retrieved metadata size mismatches input key count.
+        RuntimeError: When the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -489,7 +508,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | Non
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
         ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
@@ -510,7 +529,13 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | Non
     return tq_client._run_coroutine(async_kv_batch_get_by_meta(meta=meta, select_fields=select_fields))
 
 
-def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None) -> TensorDict:
+def kv_batch_get(
+    keys: list[str] | str,
+    partition_id: str,
+    select_fields: list[str] | str | None = None,
+    data_parser: Callable[[dict[str, list], list | None], dict[str, list]] | None = None,
+    parser_args: list | None = None,
+) -> TensorDict:
     """Get data from TransferQueue using user-specified keys.
 
     This is a convenience method for retrieving data using keys instead of indexes.
@@ -519,13 +544,41 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        data_parser: Advanced. Optional ``data_parser(data, args) -> dict`` that each storage
+            unit runs on its share of the batch before replying, so only the parsed values cross
+            the network (the get-side counterpart of ``kv_batch_put``'s ``data_parser``).
+            ``data`` maps each selected field to a list with one stored value per sample on that
+            unit, and ``args`` holds the matching ``parser_args`` entries (None without
+            ``parser_args``). Each field may be parsed differently, but the returned dict must
+            keep the keys and the number and order of values per field. Constraints:
+
+            - Do not modify stored values in place (e.g. ``tensor.add_()``, ``value.append()``):
+              ``data`` holds the stored objects, so the change would persist and also reach
+              later readers. Build new values instead; replacing entries of ``data`` is safe.
+            - Keep it free of side effects. Like ``kv_batch_put`` with a parser, a storage-unit
+              timeout is not retried and the call raises; retrying it yourself may run the parser
+              again for the same samples.
+            - It is sent with cloudpickle, so a module-level function must be importable on the
+              storage units. SSD-offloaded values are read in full before parsing.
+
+            A field linked by ``kv_link`` is parsed on its public row's unit, which holds it once
+            per distinct plain ``parser_args`` entry (scalars and lists of them) among the keys
+            linking to it, so only the parsed part is sent back. Only supported by SimpleStorage;
+            KV backends raise ``NotImplementedError``.
+        parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
+            Requires ``data_parser``. They are serialized like request data, so tuples
+            arrive as lists.
 
     Returns:
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a field in ``select_fields`` is not ready in every found key
+        ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
+            number of keys
+        RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
 
     Example:
         >>> import transfer_queue as tq
@@ -538,10 +591,28 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
         ...     partition_id="train",
         ...     select_fields="input_ids"
         ... )
+        >>> # Trim each key's input_ids and pick some of its images on the storage units
+        >>> def pick(data, args):
+        ...     data["input_ids"] = [ids[:n] for ids, (n, _) in zip(data["input_ids"], args)]
+        ...     data["images"] = [[imgs[i] for i in idx] for imgs, (_, idx) in zip(data["images"], args)]
+        ...     return data
+        >>> data = tq.kv_batch_get(
+        ...     keys=["sample_1", "sample_2"],
+        ...     partition_id="train",
+        ...     select_fields=["input_ids", "images"],
+        ...     data_parser=pick,
+        ...     parser_args=[(5, [0, 2]), (3, [1])],
+        ... )
     """
     tq_client = _maybe_create_tq_client()
     return tq_client._run_coroutine(
-        async_kv_batch_get(keys=keys, partition_id=partition_id, select_fields=select_fields)
+        async_kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=select_fields,
+            data_parser=data_parser,
+            parser_args=parser_args,
+        )
     )
 
 
@@ -583,7 +654,47 @@ def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     return tq_client._run_coroutine(async_kv_list(partition_id=partition_id))
 
 
-def kv_clear(keys: list[str] | str, partition_id: str) -> None:
+def kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str, Any]]:
+    """Describe which fields each key holds, including unfinalized ones.
+
+    See ``async_kv_describe``.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> rows = tq.kv_describe(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> hidden = {key: row["unfinalized"] for key, row in rows.items() if row["unfinalized"]}
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_describe(keys=keys, partition_id=partition_id))
+
+
+def kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Report which keys exist and the fields each has ready, without logging the missing ones.
+
+    ``kv_describe`` raises and ``kv_batch_get`` warns for a missing key or partition; this
+    treats absence as an ordinary answer, for probing keys that are often not written yet,
+    e.g. whether another worker has already put a shared prompt.
+
+    Args:
+        keys: Single key or list of keys to look up.
+        partition_id: Partition containing the keys; it need not exist.
+
+    Returns:
+        ``{key: sorted ready field names}`` for every key that exists, linked fields included.
+        Missing keys are left out; a key with no ready field (e.g. being cleared) maps to ``[]``.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> ready = tq.kv_exists(keys=["prompt_0", "prompt_1"], partition_id=tq.PUBLIC_PARTITION)
+        >>> missing = [key for key in ("prompt_0", "prompt_1") if key not in ready]
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_exists(keys=keys, partition_id=partition_id))
+
+
+def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Clear key-value pairs from TransferQueue.
 
     This removes the specified keys and their associated data from both
@@ -592,6 +703,9 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     Args:
         keys: Single key or list of keys to clear
         partition_id: Partition containing the keys
+        fields: If given, clear only these fields and keep the keys. A cleared field
+            reads as never written: it is not ready and can be put again. Tags and
+            consumption status are kept. Missing keys and fields are ignored.
 
     Example:
         >>> import transfer_queue as tq
@@ -600,10 +714,140 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
         >>> tq.kv_clear(keys="sample_1", partition_id="train")
         >>> # Clear multiple keys
         >>> tq.kv_clear(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> # Release one field but keep the keys
+        >>> tq.kv_clear(keys=["sample_1", "sample_2"], partition_id="train", fields="pixel_values")
     """
 
     tq_client = _maybe_create_tq_client()
-    tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id))
+    tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id, fields=fields))
+
+
+def kv_link(keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str) -> None:
+    """Let ``keys`` read ``fields`` from ``public_key`` in ``PUBLIC_PARTITION`` without another copy.
+
+    Put a payload shared by many keys, e.g. the video of a GRPO prompt read by its n
+    responses, once into ``tq.PUBLIC_PARTITION`` and link the keys to it. Its rows are
+    spread evenly over the storage units, apart from the rows of every other partition.
+    Missing ``keys`` are created, and linked fields read the public key's payload and are
+    ready whenever its fields are. ``kv_put`` and ``kv_update`` refuse a linked field, so
+    a read-modify-write must leave it out; clearing a linked key or field drops only the
+    link, after which the field takes a private value. ``public_key`` cannot be written
+    or cleared while keys link to it.
+
+    Args:
+        keys: Single key or list of keys that will read the linked fields.
+        partition_id: Partition holding ``keys``; not ``PUBLIC_PARTITION``.
+        public_key: Key in ``PUBLIC_PARTITION`` that has produced ``fields``, or a list of
+            such keys aligned with ``keys`` to link a whole batch in one atomic call.
+        fields: Single field name or list of field names to link.
+
+    Raises:
+        RuntimeError: If a public key does not exist or has not produced all of ``fields``,
+            a list ``public_key`` is not aligned with ``keys``, or ``partition_id`` is
+            ``PUBLIC_PARTITION``. Nothing is created or linked then.
+        ValueError: If ``keys`` contains duplicates.
+        NotImplementedError: If the storage backend is not SimpleStorage.
+
+    Example:
+        >>> tq.kv_put(key="prompt_0", partition_id=tq.PUBLIC_PARTITION, fields={"video": video})
+        >>> tq.kv_link([f"prompt_0_{i}" for i in range(n)], "train", "prompt_0", "video")
+        >>> # A batch of prompts at once: each response key with its own prompt key.
+        >>> tq.kv_link(response_keys, "train", [key.rsplit("_", 1)[0] for key in response_keys], "video")
+    """
+    tq_client = _maybe_create_tq_client()
+    tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
+
+
+def kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
+    """Clear every key in ``PUBLIC_PARTITION`` that keys linked to but none links to now; return them.
+
+    For example, after clearing a step's trajectories, this frees the prompt videos no
+    trajectory reads any more. A public key never linked yet is left alone, so a producer
+    between its ``kv_put`` and ``kv_link`` is safe; pass it in ``stale_keys`` once its
+    producer is given up on. A ``kv_link`` that races with it is refused for the keys it
+    clears. ``PUBLIC_PARTITION`` is shared by every job on this TransferQueue, so prefix
+    public keys with a job id.
+
+    Args:
+        stale_keys: Public keys to clear as well if no key links to them now, even if none
+            ever did, e.g. the keys a previous call left behind. Missing keys are ignored.
+
+    Example:
+        >>> tq.kv_clear(trajectory_keys, partition_id="train")
+        >>> freed = tq.kv_clear_unlinked_public(stale_keys=keys_left_by_the_previous_step)
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_clear_unlinked_public(stale_keys))
+
+
+def kv_update(
+    key: str,
+    partition_id: str,
+    fields: dict[str, Any],
+    merge_fn: Callable[[Any, Any], Any],
+    finalize: bool = True,
+) -> KVBatchMeta:
+    """Merge new values into the fields of one key, adding the key or fields if missing.
+
+    A missing key is created and a field the controller does not record for the key
+    yet is stored as given, without calling ``merge_fn``. Unlike ``kv_put``, it takes
+    no ``tags`` or ``data_parser``.
+
+    Args:
+        key: User-specified key. Created if missing.
+        partition_id: Partition that holds the key.
+        fields: New values keyed by field name.
+        merge_fn: ``merge_fn(old, new) -> stored`` for fields the key already holds,
+            hidden ones included. SimpleStorage runs it once per field on the unit
+            that owns the sample.
+        finalize: If False, the updated fields stay hidden from consumers until an update
+            with True (the default), so a field built over several updates never shows an
+            intermediate value. Hiding a field that is already ready is not guaranteed:
+            readers that already hold its metadata can still see the new value.
+
+    Returns:
+        Metadata for the updated sample.
+
+    Raises:
+        TypeError: If ``fields`` is not a non-empty dict or ``merge_fn`` is not callable.
+        RuntimeError: If ``merge_fn`` fails or a stored value would change the field's
+            tensor/non-tensor type or dtype; the failing storage unit writes nothing. Also
+            if a field is linked by ``kv_link``, before anything is registered or written.
+        NotImplementedError: If the storage backend is not SimpleStorage.
+
+    Note:
+        A timeout has an unknown outcome because the storage unit may finish the
+        merge after the caller stops waiting. Do not blindly retry a merge.
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(
+        async_kv_update(
+            key=key,
+            partition_id=partition_id,
+            fields=fields,
+            merge_fn=merge_fn,
+            finalize=finalize,
+        )
+    )
+
+
+def kv_batch_update(
+    keys: list[str],
+    partition_id: str,
+    fields: TensorDict,
+    merge_fn: Callable[[Any, Any], Any],
+    finalize: bool = True,
+) -> KVBatchMeta:
+    """Merge batched values into the fields of keys, adding keys or fields if missing.
+
+    See ``kv_update``. ``keys`` must be unique; a repeated key raises ``ValueError``
+    before anything is registered or written. A timeout has an unknown outcome because
+    a unit may commit after the caller stops waiting. Do not blindly retry a merge.
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(
+        async_kv_batch_update(keys=keys, partition_id=partition_id, fields=fields, merge_fn=merge_fn, finalize=finalize)
+    )
 
 
 # ==================== KV Interface API ====================
@@ -648,6 +892,8 @@ async def async_kv_put(
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -711,6 +957,13 @@ async def async_kv_put(
     )
 
 
+def _check_unique_keys(keys: list[str]) -> None:
+    # KVBatchMeta rejects duplicates only after the write has landed, so reject them before any RPC.
+    duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"keys must be unique, got duplicates: {duplicates[:20]}")
+
+
 async def async_kv_batch_put(
     keys: list[str],
     partition_id: str,
@@ -748,7 +1001,10 @@ async def async_kv_batch_put(
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
         ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
+        ValueError: If `keys` contains duplicates
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -771,6 +1027,7 @@ async def async_kv_batch_put(
             f"`keys` with length {len(keys)} does not match the `fields` TensorDict with "
             f"batch_size {fields.batch_size[0]}"
         )
+    _check_unique_keys(keys)
 
     tq_client = _maybe_create_tq_client()
 
@@ -826,7 +1083,7 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str]
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
         ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
@@ -865,7 +1122,11 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str]
 
 
 async def async_kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None
+    keys: list[str] | str,
+    partition_id: str,
+    select_fields: list[str] | str | None = None,
+    data_parser: Callable[[dict[str, list], list | None], dict[str, list]] | None = None,
+    parser_args: list | None = None,
 ) -> TensorDict:
     """Asynchronously get data from TransferQueue using user-specified keys.
 
@@ -875,13 +1136,20 @@ async def async_kv_batch_get(
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        data_parser: Advanced. Optional parser the storage units run before replying; see
+            ``kv_batch_get`` for its contract and constraints.
+        parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
 
     Returns:
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a field in ``select_fields`` is not ready in every found key
+        ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
+            number of keys
+        RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
 
     Example:
         >>> import transfer_queue as tq
@@ -901,18 +1169,33 @@ async def async_kv_batch_get(
 
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
+    # The controller drops missing keys from the meta, so the rows would no longer line up with keys.
+    requested = [keys] if isinstance(keys, str) else keys
+    if batch_meta.size != len(requested):
+        found = set(await tq_client.async_kv_retrieve_keys(batch_meta.global_indexes, partition_id))
+        missing = [key for key in requested if key not in found]
+        raise ValueError(
+            f"{len(missing)} of {len(requested)} keys were not found in partition {partition_id!r}: {missing[:20]}"
+        )
 
     if select_fields is not None:
         if isinstance(select_fields, str):
             fields_to_fetch = [select_fields]
         else:
             fields_to_fetch = select_fields
+        # The meta keeps only fields ready in every key; select_fields would drop the rest silently.
+        not_ready = [f for f in fields_to_fetch if f not in batch_meta.field_names]
+        if not_ready:
+            raise ValueError(
+                f"Fields {not_ready} are not ready in all the requested keys: missing, or written by "
+                "kv_update(finalize=False) and not finalized yet"
+            )
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
         raise ValueError("Some fields are not ready in all the requested keys!")
 
-    data = await tq_client.async_get_data(batch_meta)
+    data = await tq_client.async_get_data(batch_meta, data_parser=data_parser, parser_args=parser_args)
     return data
 
 
@@ -958,7 +1241,48 @@ async def async_kv_list(partition_id: str | None = None) -> dict[str, dict[str, 
     return partition_info
 
 
-async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
+async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str, Any]]:
+    """Asynchronously describe which fields each key holds, including unfinalized ones.
+
+    ``kv_batch_get`` returns only fields that are ready in every key, so this is the way
+    to find fields written by ``kv_update(finalize=False)`` and not yet finalized.
+
+    Args:
+        keys: Single key or list of keys to describe.
+        partition_id: Partition containing the keys.
+
+    Returns:
+        ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every field the key
+        can read, linked ones included, and ``unfinalized`` the subset that is not ready yet.
+        ``links`` maps each field linked by ``kv_link`` to its key in ``PUBLIC_PARTITION``,
+        whose readiness it shares.
+
+    Raises:
+        RuntimeError: If the partition or any key does not exist.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> rows = await tq.async_kv_describe(keys="sample_1", partition_id="train")
+        >>> print(rows["sample_1"]["unfinalized"])
+    """
+    keys = [keys] if isinstance(keys, str) else keys
+    tq_client = _maybe_create_tq_client()
+    description = await tq_client.async_kv_describe(list(dict.fromkeys(keys)), partition_id)
+    return {
+        key: {"fields": row["fields"], "unfinalized": row["unfinalized"], "links": row["links"]}
+        for key, row in description["rows"].items()
+    }
+
+
+async def async_kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Asynchronously report which keys exist and their ready fields. See ``kv_exists``."""
+    keys = [keys] if isinstance(keys, str) else keys
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_kv_exists(list(dict.fromkeys(keys)), partition_id)
+
+
+async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Asynchronously clear key-value pairs from TransferQueue.
 
     This removes the specified keys and their associated data from both
@@ -967,6 +1291,7 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
     Args:
         keys: Single key or list of keys to clear
         partition_id: Partition containing the keys
+        fields: If given, clear only these fields and keep the keys. See ``kv_clear``.
 
     Example:
         >>> import transfer_queue as tq
@@ -975,16 +1300,119 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
         >>> await tq.async_kv_clear(keys="sample_1", partition_id="train")
         >>> # Clear multiple keys
         >>> await tq.async_kv_clear(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> # Release one field but keep the keys
+        >>> await tq.async_kv_clear(keys=["sample_1", "sample_2"], partition_id="train", fields="pixel_values")
     """
 
     if isinstance(keys, str):
         keys = [keys]
 
     tq_client = _maybe_create_tq_client()
+    if fields is not None:
+        await tq_client.async_kv_clear_fields(
+            keys=keys, partition_id=partition_id, fields=[fields] if isinstance(fields, str) else fields
+        )
+        return
+
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
         await tq_client.async_clear_samples(batch_meta)
+
+
+async def async_kv_link(
+    keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str
+) -> None:
+    """Asynchronously let ``keys`` read ``fields`` from ``public_key``. See ``kv_link``."""
+    tq_client = _maybe_create_tq_client()
+    keys = [keys] if isinstance(keys, str) else keys
+    _check_unique_keys(keys)
+    public_keys = [public_key] * len(keys) if isinstance(public_key, str) else public_key
+    await tq_client.async_kv_link(keys, partition_id, public_keys, [fields] if isinstance(fields, str) else fields)
+
+
+async def async_kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
+    """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to. See ``kv_clear_unlinked_public``."""
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_clear_unlinked_public(stale_keys)
+
+
+def _single_update_batch(fields: dict[str, Any]) -> TensorDict:
+    """Wrap one sample's field mapping in a one-row TensorDict."""
+    if not isinstance(fields, dict) or not fields:
+        raise TypeError("fields must be a non-empty dict")
+    batch: dict[str, Any] = {}
+    for field_name, value in fields.items():
+        if not isinstance(field_name, str):
+            raise TypeError("field names must be strings")
+        if isinstance(value, torch.Tensor):
+            if value.is_nested:
+                raise ValueError("Use async_kv_batch_update for nested tensors")
+            batch[field_name] = value.unsqueeze(0)
+        else:
+            batch[field_name] = NonTensorStack(value)
+    return TensorDict(batch, batch_size=[1])
+
+
+async def async_kv_update(
+    key: str,
+    partition_id: str,
+    fields: dict[str, Any],
+    merge_fn: Callable[[Any, Any], Any],
+    finalize: bool = True,
+) -> KVBatchMeta:
+    """Asynchronously merge or add fields of one key. See ``kv_update``."""
+    return await async_kv_batch_update(
+        keys=[key],
+        partition_id=partition_id,
+        fields=_single_update_batch(fields),
+        merge_fn=merge_fn,
+        finalize=finalize,
+    )
+
+
+async def async_kv_batch_update(
+    keys: list[str],
+    partition_id: str,
+    fields: TensorDict,
+    merge_fn: Callable[[Any, Any], Any],
+    finalize: bool = True,
+) -> KVBatchMeta:
+    """Asynchronously merge or add batched fields of keys. See ``kv_update``."""
+    if not isinstance(keys, list) or not keys or not all(isinstance(key, str) for key in keys):
+        raise TypeError("keys must be a non-empty list of strings")
+    if not isinstance(fields, TensorDict) or not fields.keys():
+        raise TypeError("fields must be a non-empty TensorDict")
+    if fields.batch_size != torch.Size([len(keys)]):
+        raise ValueError(f"fields batch size {fields.batch_size} does not match {len(keys)} keys")
+    if not callable(merge_fn):
+        raise TypeError("merge_fn must be callable")
+    _check_unique_keys(keys)
+    tq_client = _maybe_create_tq_client()
+    # Checked up front: missing keys are registered before storage is asked to merge.
+    if not isinstance(tq_client.storage_manager, AsyncSimpleStorageManager):
+        raise NotImplementedError(
+            f"kv_update is not supported by {type(tq_client.storage_manager).__name__}; "
+            "it requires the SimpleStorage backend"
+        )
+    batch_meta, merge_plan = await tq_client.async_kv_prepare_update(
+        keys=keys, partition_id=partition_id, fields=list(fields.keys())
+    )
+
+    if batch_meta.size != len(keys):
+        raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match {len(keys)} keys")
+
+    batch_meta = await tq_client.async_update(
+        metadata=batch_meta, values=fields, merge_fn=merge_fn, merge_plan=merge_plan, finalize=finalize
+    )
+
+    return KVBatchMeta(
+        keys=keys,
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=batch_meta.field_names,
+        extra_info=batch_meta.extra_info,
+    )
 
 
 # ==================== Low-Level Native API ====================
@@ -1141,3 +1569,149 @@ def load_checkpoint(
     client.load_controller_checkpoint(str(controller_path))
 
     logger.info(f"Checkpoint loaded from {checkpoint_dir}")
+
+
+# ==================== Selective Data Dump API ====================
+
+
+def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -> dict[str, int]:
+    """Dump the rows addressed by ``keys`` into ``dump_dir``.
+
+    Each storage unit pickles the rows it owns in its own process, so the payload never
+    passes through the caller. The caller writes only a small row index.
+
+    The dump is staged in a uniquely named sibling directory and renamed into place
+    once durable. An existing ``dump_dir`` is refused, so a published dump is never
+    replaced: loads need no lock and readers no write access.
+
+    .. note::
+        **Multi-node limitation**: dump_dir must reside on a shared network filesystem
+        (e.g. NFS, GPFS, Lustre) reachable from every storage unit, because each unit
+        writes its own shard from its own node.
+
+    Callers must freeze writers for ``keys`` for the duration: TransferQueue has no
+    atomic snapshot, so a concurrent put can land between the row index and the shards.
+
+    Args:
+        dump_dir: Directory to write the dump into.
+        keys: Keys to dump. Duplicates are dropped, first occurrence wins. Fields linked
+            by ``kv_link`` are dumped as links by public key name; dump those
+            ``PUBLIC_PARTITION`` keys too and load that dump first, since load relinks to
+            whatever the names hold then.
+        partition_id: Partition that owns ``keys``.
+
+    Returns:
+        ``{"keys", "rows_with_data", "shards", "bytes"}``.
+
+    Raises:
+        FileExistsError: ``dump_dir`` already exists.
+        RuntimeError: TransferQueue is not initialized, the partition or a key does not
+            exist, or a storage unit holds no data for a row it was asked to dump.
+        NotImplementedError: The storage backend does not support selective dumps.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    dump_dir = Path(dump_dir).resolve()
+    if dump_dir.exists():
+        raise FileExistsError(f"{dump_dir} already exists; write each dump to a new directory")
+    unique_keys = list(dict.fromkeys(keys))
+    client = _maybe_create_tq_client()
+    # A unique staging name keeps concurrent dumps to the same path from sharing files.
+    tmp_dir = dump_dir.with_name(f"{dump_dir.name}.tmp-{uuid4().hex}")
+    tmp_dir.mkdir(parents=True)
+
+    try:
+        description = client.kv_describe(unique_keys, partition_id) if unique_keys else {"rows": {}, "field_schema": {}}
+        row_index = {"partition_id": partition_id, **description}
+        rows = row_index["rows"]
+        # Linked payloads stay with their public keys; the row index records them as links.
+        for row in rows.values():
+            row["fields"] = [name for name in row["fields"] if name not in row["links"]]
+            row["unfinalized"] = [name for name in row["unfinalized"] if name not in row["links"]]
+        # A row whose fields are all still unproduced has nothing for a storage unit to
+        # dump, but it keeps its key and tag so the restore can recreate the row.
+        fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
+        shard_records = []
+        if fields_by_index:
+            dumped = client.dump_rows_by_index(str(tmp_dir / data_dump.SHARD_SUBDIR), fields_by_index)
+            shard_records = dumped["shards"]
+            row_index["field_schema"] = data_dump.dump_field_schema(row_index["field_schema"], dumped["row_schema"])
+        data_dump.publish_dump(tmp_dir, dump_dir, row_index, shard_records)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
+    logger.info(f"Dumped {len(unique_keys)} keys of partition {partition_id} to {dump_dir}")
+    return {
+        "keys": len(unique_keys),
+        "rows_with_data": len(fields_by_index),
+        "shards": len(shard_records),
+        "bytes": total_bytes,
+    }
+
+
+def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
+    """Merge selected rows into the running system, preserving existing key indexes.
+
+    SimpleStorage units read their assigned indexed records directly and in parallel.
+    New keys receive current indexes; unrelated rows and fields remain untouched.
+    Writers and clears for these keys must be paused during restore. As with
+    ``kv_batch_put``, a failure may leave new keys registered and existing keys' fields
+    partially overwritten; retrying is idempotent.
+
+    Args:
+        dump_dir: Directory previously written by ``dump_data_by_key``. It must be
+            accessible from every storage unit.
+
+    Returns:
+        ``{key: tag}`` for every restored key.
+
+    Raises:
+        RuntimeError: TransferQueue is not initialized, a storage unit fails, or a key
+            linked to ``PUBLIC_PARTITION`` names a public key that does not exist.
+        NotImplementedError: The storage backend is not SimpleStorage.
+        FileNotFoundError: The dump is incomplete.
+        ValueError: The manifest or a row disagrees with the row index, or a linked public
+            field is not ready.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    client = _maybe_create_tq_client()
+    # Checked up front: the client registers the keys before any unit reads a shard.
+    if not isinstance(client.storage_manager, AsyncSimpleStorageManager):
+        raise NotImplementedError(f"{type(client.storage_manager).__name__} does not support selective data load")
+
+    dump_dir = Path(dump_dir).resolve()
+    row_index, shards = data_dump.read_dump(dump_dir)
+    partition_id = row_index["partition_id"]
+    rows = row_index["rows"]
+    client.validate_dump_schema(partition_id, row_index["field_schema"])
+    # Checked before loading anything: relinking needs the public fields, restored by their own load.
+    public_keys = sorted({key for row in rows.values() for key in row.get("links", {}).values()})
+    if public_keys:
+        public_rows = client.kv_describe(public_keys, PUBLIC_PARTITION)["rows"]
+        unready = sorted(
+            {
+                key
+                for row in rows.values()
+                for name, key in row.get("links", {}).items()
+                if name not in public_rows[key]["fields"] or name in public_rows[key]["unfinalized"]
+            }
+        )
+        if unready:
+            raise ValueError(f"linked fields of {PUBLIC_PARTITION!r} keys {unready} are not ready; load them first")
+    # Links first: kv_link checks field types before creating any key, so an incompatible
+    # destination fails before any payload is written. One kv_link per linked field set.
+    link_groups: dict[tuple[str, ...], list[tuple[str, str]]] = defaultdict(list)
+    for key, row in rows.items():
+        links = row.get("links", {})
+        for public_key in set(links.values()):
+            link_groups[tuple(sorted(name for name, k in links.items() if k == public_key))].append((key, public_key))
+    for names, pairs in link_groups.items():
+        client.kv_link([key for key, _ in pairs], partition_id, [public_key for _, public_key in pairs], list(names))
+    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
+    logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
+    return {key: row["tag"] for key, row in rows.items()}

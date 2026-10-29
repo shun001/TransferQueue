@@ -15,6 +15,7 @@
 
 """Storage-unit retry and timeout-diagnosis tests."""
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -63,6 +64,79 @@ def _single_sample_batch() -> tuple[TensorDict, BatchMeta]:
     return TensorDict({"input_ids": torch.zeros(1, 2, dtype=torch.int64)}, batch_size=1), metadata
 
 
+class _SocketLease:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self.socket
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_controller_notification_returns_ack_status(accepted):
+    manager = _manager()
+    manager.controller_info = MagicMock(id="controller")
+    socket = MagicMock()
+    socket.send_multipart = AsyncMock()
+    socket.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+            sender_id="controller",
+            body={"success": accepted},
+        ).serialize()
+    )
+    manager.notify_pool = MagicMock()
+    manager.notify_pool.alease.return_value = _SocketLease(socket)
+
+    assert await manager._notify_and_wait([b"request"]) is accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ack, published, warns",
+    [
+        (True, True, False),
+        (None, False, False),  # no ACK in time: the outcome is unknown, so the put is not failed
+        (False, False, True),
+    ],
+)
+async def test_notify_publishes_or_tolerates_ack(ack, published, warns, caplog):
+    manager = _manager()
+    manager.controller_info = MagicMock(id="controller")
+    manager._notify_loop = asyncio.get_running_loop()
+    manager._notify_and_wait = AsyncMock(return_value=ack)
+
+    with caplog.at_level(logging.WARNING):
+        assert await manager.notify_data_update("p", [0, 1], {}) is published
+    assert ("no longer exists" in caplog.text) is warns
+
+
+@pytest.mark.asyncio
+async def test_notify_raises_on_request_error_without_waiting_for_timeout():
+    manager = _manager()
+    manager.controller_info = MagicMock(id="controller")
+    manager._notify_loop = asyncio.get_running_loop()
+    socket = MagicMock()
+    socket.send_multipart = AsyncMock()
+    error = ZMQMessage.create(
+        request_type=ZMQRequestType.REQUEST_ERROR,
+        sender_id="controller",
+        body={"success": False, "message": "Field 'x' dtype mismatch"},
+    )
+    socket.recv_multipart = AsyncMock(side_effect=[error.serialize(), TimeoutError("no further reply")])
+    manager.notify_pool = MagicMock()
+    manager.notify_pool.alease.return_value = _SocketLease(socket)
+
+    with pytest.raises(RuntimeError, match="Field 'x' dtype mismatch"):
+        await manager.notify_data_update("p", [0], {})
+    socket.recv_multipart.assert_awaited_once()
+    socket.close.assert_not_called()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data: data, 1)])
 async def test_put_retries_only_without_a_parser(data_parser, expected_attempts):
@@ -79,6 +153,60 @@ async def test_put_retries_only_without_a_parser(data_parser, expected_attempts)
         await manager.put_data(data, metadata, data_parser=data_parser)
 
     assert manager._put_to_single_storage_unit.await_count == expected_attempts
+    manager.notify_data_update.assert_not_awaited()
+
+
+_HELD_INPUT_IDS = {"input_ids": {"dtype": torch.int64, "is_non_tensor": False, "held": [True]}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data, args: data, 1)])
+async def test_get_retries_only_without_a_parser(data_parser, expected_attempts):
+    manager = _manager()
+    manager._get_from_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("no answer"))
+    _, metadata = _single_sample_batch()
+
+    with (
+        patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
+        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
+        pytest.raises(StorageUnitTimeout),
+    ):
+        await manager.get_data(metadata, data_parser=data_parser)
+
+    assert manager._get_from_single_storage_unit.await_count == expected_attempts
+
+
+@pytest.mark.asyncio
+async def test_update_reports_controller_rejection_after_storage_commit():
+    manager = _manager()
+    manager._update_to_single_storage_unit = AsyncMock(
+        return_value={"input_ids": {"dtype": torch.int64, "shapes": [(3,)]}}
+    )
+    manager.notify_data_update = AsyncMock(return_value=False)
+    values, metadata = _single_sample_batch()
+
+    with pytest.raises(RuntimeError, match="Storage update committed.*do not retry"):
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
+
+    manager._update_to_single_storage_unit.assert_awaited_once()
+    manager.notify_data_update.assert_awaited_once()
+
+    manager.notify_data_update = AsyncMock(side_effect=RuntimeError("Controller failed to record written data: dtype"))
+    with pytest.raises(RuntimeError, match="Storage update committed.*notification failed.*dtype.*do not retry"):
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
+
+
+@pytest.mark.asyncio
+async def test_update_timeout_is_not_retried_or_published():
+    manager = _manager()
+    manager._update_to_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("outcome unknown"))
+    manager.notify_data_update = AsyncMock()
+    values, metadata = _single_sample_batch()
+
+    with patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"), pytest.raises(StorageUnitTimeout):
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
+
+    manager._update_to_single_storage_unit.assert_awaited_once()
     manager.notify_data_update.assert_not_awaited()
 
 

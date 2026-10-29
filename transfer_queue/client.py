@@ -24,8 +24,10 @@ import zmq
 import zmq.asyncio
 from tensordict import TensorDict
 
+from transfer_queue.controller import PUBLIC_PARTITION
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -48,6 +50,9 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
+# A DEALER drops a reply it can no longer route, so without a bound a lost response blocks
+# the caller forever. Generous: a busy controller is normal, an unanswered request is not.
+TQ_CONTROLLER_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_SEND_RECV_TIMEOUT", 200))  # seconds
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
@@ -156,6 +161,7 @@ class AsyncTransferQueueClient:
             self.zmq_context,
             client_id,
             "request_handle_socket",
+            timeout=TQ_CONTROLLER_SEND_RECV_TIMEOUT,
         )
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
@@ -407,13 +413,27 @@ class AsyncTransferQueueClient:
                          Do not change the inner order of values within each column.
                          Only supported by SimpleStorage.
 
+        Warning:
+            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
+            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
+            links. A linked field is refused only by the links ``metadata`` still carries, so a
+            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
+            private copies of its linked fields and drops those links. To write back a batch
+            holding linked fields, select the fields to write from ``data``, e.g.
+            ``put(batch.select("response"), metadata=linked)``.
+
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it: the check before writing does not reserve the row; see ``async_link``.
+
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
-            RuntimeError: If storage operation fails
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
+                other rows link to: those stay read-only until no row links to them
 
         Example:
             >>> batch_size = 4
@@ -462,6 +482,7 @@ class AsyncTransferQueueClient:
                     f"You may receive 2D tensors in key-value based backend."
                 )
 
+        inserted = metadata is None
         if metadata is None:
             if partition_id is None:
                 raise ValueError("partition_id must be provided if metadata is not given")
@@ -475,6 +496,20 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        # A read-modify-write would otherwise turn every link into a private copy without notice.
+        linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
+        if linked:
+            raise ValueError(
+                f"fields {linked} are linked by kv_link on some samples; leave them out of the put, "
+                "or kv_clear those fields first to store private values"
+            )
+        public_rows = [
+            idx
+            for idx, pid in zip(metadata.global_indexes, metadata.partition_ids, strict=True)
+            if pid == PUBLIC_PARTITION
+        ]
+        if public_rows and not inserted:
+            await self._check_public_write(public_rows)
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
@@ -492,11 +527,55 @@ class AsyncTransferQueueClient:
 
         return metadata
 
-    async def async_get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def async_update(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+        finalize: bool = True,
+    ) -> BatchMeta:
+        """Merge new values into fields on SimpleStorage units, storing them where absent.
+
+        Args:
+            metadata: Samples to update, already registered with the controller.
+            values: New values aligned with ``metadata``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
+            merge_plan: Per-field column type and held rows, from ``async_kv_prepare_update``.
+            finalize: If False, keep the updated fields hidden from consumers.
+
+        Returns:
+            The same metadata with field_schema and production status updated.
+
+        Raises:
+            NotImplementedError: If the storage backend is not SimpleStorage.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before performing storage operations."
+            )
+        if not metadata or metadata.size == 0:
+            raise ValueError("metadata cannot be none or empty")
+
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, merge_plan, finalize=finalize)
+        if not finalize:
+            metadata.production_status[:] = 0
+        return metadata.apply_field_schema(field_schema, set_all_ready=finalize)
+
+    async def async_get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """Asynchronously fetch data from storage units and organize into TensorDict.
 
         Args:
             metadata: Batch metadata containing data location information and global indexes
+            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
+                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing:
@@ -526,11 +605,22 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0 or len(metadata.field_names) == 0:
             logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to get_data. Returning empty TensorDict.")
             return TensorDict({}, batch_size=0)
+        if parser_args is not None:
+            if data_parser is None:
+                raise ValueError("parser_args requires data_parser")
+            if len(parser_args) != metadata.size:
+                raise ValueError(f"parser_args has {len(parser_args)} entries for {metadata.size} samples")
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_get_data"
         ):
-            results = await self.storage_manager.get_data(metadata)
+            # Passed only when set, so custom managers with get_data(self, metadata) keep working.
+            if data_parser is None:
+                results = await self.storage_manager.get_data(metadata)
+            else:
+                results = await self.storage_manager.get_data(
+                    metadata, data_parser=data_parser, parser_args=parser_args
+                )
 
         logger.debug(f"[{self.client_id}]: get_data with {metadata.size} samples successfully.")
 
@@ -981,6 +1071,46 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}] Failed in async_kv_retrieve_meta: {e}") from e
 
     @with_controller_socket
+    async def async_kv_prepare_update(
+        self, keys: list[str], partition_id: str, fields: list[str], socket=None
+    ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
+        """Register missing keys and get, per field, its column type and which rows hold it.
+
+        Returns:
+            The keys' BatchMeta and the ``merge_plan`` that ``async_update`` takes.
+        """
+        response_msg = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_PREPARE_UPDATE,
+            response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "fields": fields},
+        )
+        return response_msg.body["metadata"], response_msg.body["merge_plan"]
+
+    async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
+        """Clear fields of existing keys while keeping the keys, tags and consumption status.
+
+        The controller marks the fields as unproduced before storage deletes them, so no
+        reader sees a ready field whose value is gone.
+        """
+        metadata = await self._kv_clear_fields_in_controller(keys, partition_id, fields)
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata, fields=metadata.field_names)
+
+    @with_controller_socket
+    async def _kv_clear_fields_in_controller(
+        self, keys: list[str], partition_id: str, fields: list[str], socket=None
+    ) -> BatchMeta:
+        """Clear fields in the controller and return the cleared cells' metadata."""
+        response_msg = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_CLEAR_FIELDS,
+            response_type=ZMQRequestType.KV_CLEAR_FIELDS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "fields": fields},
+        )
+        return response_msg.body["metadata"]
+
+    @with_controller_socket
     async def async_kv_retrieve_keys(
         self,
         global_indexes: list[int] | int,
@@ -1067,6 +1197,162 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
+    @with_controller_socket
+    async def async_kv_describe(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, Any]:
+        """Asynchronously describe each key's row and its fields' declared types, without payloads.
+
+        Unlike ``kv_retrieve_meta``, every row keeps its own produced fields, and a missing
+        key raises instead of being dropped.
+
+        Returns:
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
+            {field: {"is_nested", "is_non_tensor"}}}``.
+        """
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_DESCRIBE,
+            response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
+
+    @with_controller_socket
+    async def async_kv_exists(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, list[str]]:
+        """Asynchronously map each existing key to its ready fields; see ``kv_exists``."""
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_EXISTS,
+            response_type=ZMQRequestType.KV_EXISTS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return response.body["ready"]
+
+    @with_controller_socket
+    async def async_kv_link(
+        self,
+        keys: list[str],
+        partition_id: str,
+        public_keys: list[str],
+        fields: list[str],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Asynchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
+        if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support kv_link")
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_LINK,
+            response_type=ZMQRequestType.KV_LINK_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "public_keys": public_keys, "fields": fields},
+        )
+
+    @with_controller_socket
+    async def async_link(
+        self,
+        metadata: BatchMeta,
+        public_metadata: BatchMeta,
+        fields: list[str] | str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> BatchMeta:
+        """Asynchronously make ``fields`` of each row of ``metadata`` read the aligned row of ``public_metadata``.
+
+        The BatchMeta counterpart of ``kv_link``: neither side needs a key, so rows put through a
+        BatchMeta, e.g. ``put(data, partition_id=PUBLIC_PARTITION)``, can be shared too. A linked
+        public row is read-only, and ``clear_samples`` refuses it, until no row links to it;
+        ``kv_clear_unlinked_public`` then frees it.
+
+        Args:
+            metadata: Rows of one partition, not ``PUBLIC_PARTITION``, that will read ``fields``.
+            public_metadata: Rows of ``PUBLIC_PARTITION`` that produced ``fields``, aligned with ``metadata``.
+            fields: Single field name or list of field names to link.
+
+        Warning:
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it. A put checks the row's links before writing storage but does not reserve it,
+            so a link accepted in between reads the old payload and then the new one. Write each
+            public row once before linking it; to replace one, wait until no row links to it,
+            overwrite it, wait for the put to return, and only then link to it again.
+
+        Returns:
+            ``metadata``'s rows over its fields and ``fields``, carrying the new links and keeping
+            ``metadata``'s ``extra_info`` and ``custom_meta``; reads and puts through it see the links.
+
+        Raises:
+            ValueError: ``metadata`` spans several partitions or ``public_metadata`` is not all in
+                ``PUBLIC_PARTITION``.
+            RuntimeError: The controller refused the link; see ``TransferQueueController.link``.
+            NotImplementedError: If the storage backend is not SimpleStorage.
+        """
+        if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support link")
+        fields = [fields] if isinstance(fields, str) else list(fields)
+        partition_ids = set(metadata.partition_ids)
+        if len(partition_ids) != 1:
+            raise ValueError(f"metadata must cover exactly one partition, got {sorted(partition_ids)}")
+        if set(public_metadata.partition_ids) != {PUBLIC_PARTITION}:
+            raise ValueError(f"public_metadata must cover only partition {PUBLIC_PARTITION!r}")
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.LINK,
+            response_type=ZMQRequestType.LINK_RESPONSE,
+            body={
+                "global_indexes": metadata.global_indexes,
+                "partition_id": partition_ids.pop(),
+                "public_indexes": public_metadata.global_indexes,
+                "fields": fields,
+                "data_fields": list(dict.fromkeys([*metadata.field_names, *fields])),
+            },
+        )
+        linked: BatchMeta = response.body["metadata"]
+        # The controller knows only synced custom_meta, and extra_info never leaves the caller.
+        linked.extra_info = dict(metadata.extra_info)
+        linked.custom_meta = [dict(meta) for meta in metadata.custom_meta]
+        return linked
+
+    @with_controller_socket
+    async def _check_public_write(self, global_indexes: list[int], socket=None) -> None:
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.CHECK_PUBLIC_WRITE,
+            response_type=ZMQRequestType.CHECK_PUBLIC_WRITE_RESPONSE,
+            body={"global_indexes": global_indexes},
+        )
+
+    async def async_clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
+        """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to; see ``kv_clear_unlinked_public``.
+
+        Returns:
+            The cleared keys.
+        """
+        metadata, keys = await self._mark_unlinked_public_clearing(stale_keys)
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata)
+            await self._clear_meta_in_controller(metadata)
+        return keys
+
+    @with_controller_socket
+    async def _mark_unlinked_public_clearing(
+        self, stale_keys: list[str] | None, socket=None
+    ) -> tuple[BatchMeta, list[str]]:
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING,
+            response_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE,
+            body={"stale_keys": stale_keys},
+        )
+        return response.body["metadata"], response.body["keys"]
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1123,6 +1409,77 @@ class AsyncTransferQueueClient:
                 if not can_destroy():
                     return False
         return True
+
+    # ==================== Selective Data Dump API ====================
+    @with_controller_socket
+    async def async_validate_dump_schema(
+        self,
+        partition_id: str,
+        field_schema: dict,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
+            response_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE,
+            body={"partition_id": partition_id, "field_schema": field_schema},
+        )
+
+    async def async_dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Asynchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before dump operations."
+            )
+        return await self.storage_manager.dump_rows_by_index(shard_dir, fields_by_index)
+
+    async def async_load_rows_by_key(
+        self,
+        partition_id: str,
+        rows: dict[str, dict[str, Any]],
+        shards: list[dict[str, Any]],
+    ) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read.
+
+        Failure semantics match ``kv_batch_put``: new keys stay registered and payload
+        writes may be partial, and retrying is idempotent because keys keep their indexes.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit fails.
+            NotImplementedError: If the storage backend does not support selective loads.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before load operations."
+            )
+        if not rows:
+            return 0
+        metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
+        target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
+        for shard in shards:
+            for record in shard["records"]:
+                record["target_index"] = target_indexes[record["key"]]
+        bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
+        metadata.update_custom_meta([row["tag"] for row in rows.values()])
+        await self.async_set_custom_meta(metadata)
+        return bytes_read
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
@@ -1294,6 +1651,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         # Bind internal sync wrappers. Public methods are defined explicitly below
         # to ensure proper type hints and documentation.
         self._put = _make_sync(self.async_put)
+        self._update = _make_sync(self.async_update)
         self._get_meta = _make_sync(self.async_get_meta)
         self._get_data = _make_sync(self.async_get_data)
         self._clear_partition = _make_sync(self.async_clear_partition)
@@ -1306,8 +1664,16 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
         self._reset_consumption = _make_sync(self.async_reset_consumption)
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
+        self._kv_prepare_update = _make_sync(self.async_kv_prepare_update)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
+        self._kv_describe = _make_sync(self.async_kv_describe)
+        self._kv_link = _make_sync(self.async_kv_link)
+        self._clear_unlinked_public = _make_sync(self.async_clear_unlinked_public)
+        self._link = _make_sync(self.async_link)
+        self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
+        self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
+        self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1441,13 +1807,27 @@ class TransferQueueClient(AsyncTransferQueueClient):
                          Do not change the inner order of values within each column.
                          Only supported by SimpleStorage.
 
+        Warning:
+            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
+            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
+            links. A linked field is refused only by the links ``metadata`` still carries, so a
+            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
+            private copies of its linked fields and drops those links. To write back a batch
+            holding linked fields, select the fields to write from ``data``, e.g.
+            ``put(batch.select("response"), metadata=linked)``.
+
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it: the check before writing does not reserve the row; see ``async_link``.
+
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
-            RuntimeError: If storage operation fails
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
+                other rows link to: those stay read-only until no row links to them
 
         Example:
             >>> batch_size = 4
@@ -1480,11 +1860,33 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
 
-    def get_data(self, metadata: BatchMeta) -> TensorDict:
+    def update(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+        finalize: bool = True,
+    ) -> BatchMeta:
+        """Synchronously merge or add values on SimpleStorage units.
+
+        See ``async_update``.
+        """
+        return self._update(metadata, values, merge_fn, merge_plan, finalize=finalize)
+
+    def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
 
         Args:
             metadata: Batch metadata containing data location information and global indexes
+            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
+                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing:
@@ -1502,7 +1904,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> print(batch)
             >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
         """
-        return self._get_data(metadata=metadata)
+        return self._get_data(metadata=metadata, data_parser=data_parser, parser_args=parser_args)
 
     def clear_partition(self, partition_id: str):
         """Synchronously clear the whole partition from all storage units and the controller.
@@ -1694,6 +2096,15 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
 
+    def kv_prepare_update(
+        self, keys: list[str], partition_id: str, fields: list[str]
+    ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
+        """Synchronously register missing keys and get the ``merge_plan`` for ``update``.
+
+        See ``async_kv_prepare_update``.
+        """
+        return self._kv_prepare_update(keys, partition_id, fields)
+
     def kv_retrieve_keys(
         self,
         global_indexes: list[int] | int,
@@ -1743,6 +2154,53 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._kv_list(partition_id=partition_id)
+
+    def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
+        """Synchronously describe each key's row and its fields' declared types, without payloads.
+
+        See ``async_kv_describe``.
+        """
+        return self._kv_describe(keys, partition_id)
+
+    def kv_link(self, keys: list[str], partition_id: str, public_keys: list[str], fields: list[str]) -> None:
+        """Synchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        return self._kv_link(keys, partition_id, public_keys, fields)
+
+    def link(self, metadata: BatchMeta, public_metadata: BatchMeta, fields: list[str] | str) -> BatchMeta:
+        """Synchronously make ``fields`` of ``metadata``'s rows read ``public_metadata``'s; see ``async_link``."""
+        return self._link(metadata, public_metadata, fields)
+
+    def clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
+        """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""
+        return self._clear_unlinked_public(stale_keys)
+
+    # ==================== Selective Data Dump API ====================
+
+    def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        return self._validate_dump_schema(partition_id, field_schema)
+
+    def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Synchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        return self._dump_rows_by_index(shard_dir, fields_by_index)
+
+    def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""
+        return self._load_rows_by_key(partition_id, rows, shards)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:

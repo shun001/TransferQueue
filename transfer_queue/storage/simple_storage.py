@@ -28,17 +28,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import os
 import pickle
 import shutil
+import sys
 import time
 import weakref
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -47,6 +51,8 @@ import ray
 import torch
 import zmq
 
+from transfer_queue.utils import compact_pickle
+from transfer_queue.utils.common import get_env_bool, limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
 from transfer_queue.storage.payload_transfer.base import KEY_NOT_FOUND_MARKER
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
@@ -123,6 +129,53 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+# Exit the unit process when its worker or proxy thread dies, so the unit fails visibly. Both are
+# daemon threads, so without this the process keeps accepting requests it can never answer and
+# looks alive. Disable only to inspect a dead worker in place.
+TQ_STORAGE_EXIT_ON_WORKER_DEATH = get_env_bool("TQ_STORAGE_EXIT_ON_WORKER_DEATH", True)
+
+# Distinguishes a worker-death abort from a normal exit in Ray's actor-failure logs.
+_WORKER_DEATH_EXIT_CODE = 70
+
+
+def _flush_log_output() -> None:
+    """Flush every handler this module's records reach, and stdio, since ``os._exit`` skips both.
+
+    ``get_logger`` adds no handler when an ancestor already has one, so the records can live
+    entirely in a parent's handlers. A failing flush is ignored: the process exits regardless.
+    """
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            with suppress(Exception):
+                handler.flush()
+        current = current.parent if current.propagate else None
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):
+            stream.flush()
+
+
+def _check_value_type(field: str, value: Any, is_tensor: bool, dtype: Any) -> None:
+    """Reject a value that would change its field's tensor/non-tensor kind or tensor dtype."""
+    if not is_tensor:
+        if isinstance(value, torch.Tensor):
+            raise TypeError(f"Value for non-tensor field {field!r} must remain non-tensor")
+    elif not isinstance(value, torch.Tensor) or (dtype is not None and value.dtype != dtype):
+        actual = value.dtype if isinstance(value, torch.Tensor) else type(value).__name__
+        raise TypeError(f"Value for tensor field {field!r} must keep dtype {dtype}, got {actual}")
+
+
+def _describe_stored_values(values: list) -> dict[str, Any]:
+    """Describe per-sample stored values for the manager.
+
+    A unit only holds part of a batch, so it reports one shape per sample and
+    leaves ``shapes=None`` for a column it cannot describe as tensors; only the
+    manager sees the whole batch and can turn this into a field_schema.
+    """
+    if not all(isinstance(v, torch.Tensor) for v in values):
+        return {"dtype": None, "shapes": None}
+    return {"dtype": values[0].dtype, "shapes": [tuple(v.shape) for v in values]}
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -223,6 +276,7 @@ class StorageUnitData:
                     f"StorageUnitData put_data: field '{f}' values length {len(values)} "
                     f"!= global_indexes length {len(global_indexes)}, length mismatch"
                 )
+        for f, values in field_data.items():
             if f not in self.field_data:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
@@ -230,16 +284,51 @@ class StorageUnitData:
                 field_dict[key] = val
         self._active_keys.update(global_indexes)
 
-    def clear(self, keys: list[int]) -> None:
+    def apply_update(
+        self,
+        global_indexes: list[int],
+        new_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Merge into held values, store the other rows as is, validate, then write once.
+
+        ``merge_plan[field]["held"]`` comes from the controller, not from this unit: a local
+        value the controller no longer tracks (e.g. after a failed clear) is overwritten,
+        never merged. Every final value must match the field's known column type. All
+        merges and checks finish before one ``put_data`` call, so a merge error, an
+        incompatible value or a held row missing here leaves storage unchanged.
+
+        Returns:
+            Per-sample description of the stored values, keyed by field name.
+        """
+        computed: dict[str, list] = {}
+        for field, new_values in new_data.items():
+            column = merge_plan[field]
+            present = [i for i, held in enumerate(column["held"]) if held]
+            old_values = self.get_data([field], [global_indexes[i] for i in present])[field] if present else []
+            values = list(new_values)
+            for i, old in zip(present, old_values, strict=True):
+                values[i] = merge_fn(old, new_values[i])
+            if column["is_non_tensor"] is not None:
+                for value in values:
+                    _check_value_type(field, value, not column["is_non_tensor"], column["dtype"])
+            computed[field] = values
+        self.put_data(computed, global_indexes)
+        return {field: _describe_stored_values(values) for field, values in computed.items()}
+
+    def clear(self, keys: list[int], fields: list[str] | None = None) -> None:
         """Remove data at given global index keys, immediately freeing memory.
 
         Args:
             keys: Global indexes to remove.
+            fields: If given, remove only these fields and keep the samples.
         """
-        for f in self.field_data:
+        for f in self.field_data if fields is None else set(fields) & self.field_data.keys():
             for key in keys:
                 self.field_data[f].pop(key, None)
-        self._active_keys -= set(keys)
+        if fields is None:
+            self._active_keys -= set(keys)
 
     def save_checkpoint(self, path: str | Path, storage_unit_id: str) -> None:
         """Write in-memory storage state to a checkpoint."""
@@ -573,38 +662,47 @@ class HybridStorageUnitData(StorageUnitData):
         unique_global_indexes = set(global_indexes)
         has_duplicate_indexes = len(unique_global_indexes) != len(global_indexes)
 
-        for field, values in field_data.items():
-            prepared_values, entries, fallback_values = self._prepare_field_values(values)
-
+        old_ssd_values = []
+        for field in field_data:
             stored_field = self.field_data.get(field, {})
-            old_ssd_values = []
             for global_index in unique_global_indexes:
                 old_value = stored_field.get(global_index)
                 if isinstance(old_value, _SSDValueRef):
                     old_ssd_values.append(old_value)
-            try:
-                super().put_data({field: prepared_values}, global_indexes)
-            except Exception:
-                for entry in entries:
-                    self._ssd_store.unlink(entry)
-                raise
 
-            obsolete_ssd_values = old_ssd_values
-            if has_duplicate_indexes:
-                retained_ssd_paths = set()
+        # Write every field's files before replacing any value: kv_update merge functions are not
+        # idempotent, so a failure on a later field must not leave earlier fields committed.
+        prepared_data = {}
+        entries: list[_SSDValueRef] = []
+        fallback_values = 0
+        try:
+            for field, values in field_data.items():
+                prepared_data[field], field_entries, field_fallback_values = self._prepare_field_values(values)
+                entries.extend(field_entries)
+                fallback_values += field_fallback_values
+            super().put_data(prepared_data, global_indexes)
+        except Exception:
+            for entry in entries:
+                self._ssd_store.unlink(entry)
+            raise
+
+        obsolete_ssd_values = old_ssd_values
+        if has_duplicate_indexes:
+            retained_ssd_paths = set()
+            for field in field_data:
                 for global_index in unique_global_indexes:
                     retained_value = self.field_data[field][global_index]
                     if isinstance(retained_value, _SSDValueRef):
                         retained_ssd_paths.add(retained_value.path)
-                obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
+            obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
 
-            self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
-            self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
-                value.size_bytes for value in obsolete_ssd_values
-            )
-            self._ssd_fallback_values_total += fallback_values
-            for obsolete_value in obsolete_ssd_values:
-                self._ssd_store.unlink(obsolete_value)
+        self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
+        self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
+            value.size_bytes for value in obsolete_ssd_values
+        )
+        self._ssd_fallback_values_total += fallback_values
+        for obsolete_value in obsolete_ssd_values:
+            self._ssd_store.unlink(obsolete_value)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Read mixed memory- and SSD-backed samples in request order."""
@@ -616,15 +714,17 @@ class HybridStorageUnitData(StorageUnitData):
                 values[position] = self._decode_sample(raw, entry)
         return result
 
-    def clear(self, keys: list) -> None:
+    def clear(self, keys: list, fields: list[str] | None = None) -> None:
         """Remove values and unlink any files they reference."""
         ssd_values: list[_SSDValueRef] = []
-        for values in self.field_data.values():
+        for field, values in self.field_data.items():
+            if fields is not None and field not in fields:
+                continue
             for key in set(keys):
                 value = values.get(key)
                 if isinstance(value, _SSDValueRef):
                     ssd_values.append(value)
-        super().clear(keys)
+        super().clear(keys, fields)
         self._ssd_active_values -= len(ssd_values)
         self._ssd_active_bytes -= sum(value.size_bytes for value in ssd_values)
         for value in ssd_values:
@@ -741,6 +841,85 @@ class HybridStorageUnitData(StorageUnitData):
     def close(self) -> None:
         """Release SSD resources owned by this hybrid store."""
         self._ssd_store.close()
+
+
+# Readers for the selective dump records that SimpleStorageUnit._handle_dump_rows writes.
+def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
+    """Read and validate exactly one record against its expected index and fields."""
+    file.seek(offset)
+    payload = file.read(length)
+    if len(payload) != length:
+        raise ValueError(f"Truncated dump row {global_index} in {file.name}")
+    row = pickle.loads(payload)
+    if row["global_index"] != global_index or set(row["fields"]) != set(fields):
+        raise ValueError(f"Dump row {global_index} disagrees with the row index in {file.name}")
+    return row["fields"]
+
+
+def validate_dump_values(values: dict, schema: dict, source_index: int) -> None:
+    """Validate persisted tensor values without changing their type or dtype."""
+    for name, value in values.items():
+        field = schema[name]
+        if field["is_non_tensor"]:
+            continue
+        shape = field.get("per_sample_shapes", {}).get(source_index) if field["is_nested"] else field["shape"]
+        if shape is None:
+            raise ValueError(f"Dump field {name!r} has no saved shape at row {source_index}")
+        actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+        # Existing dense scalar fields use a one-element metadata shape.
+        scalar = actual_shape == () and tuple(shape) == (1,) and not field["is_nested"]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype != field["dtype"]
+            or (actual_shape != tuple(shape) and not scalar)
+        ):
+            raise ValueError(f"Dump field {name!r} disagrees with its saved schema at row {source_index}")
+
+
+def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: list[int], names: tuple) -> dict:
+    """Remap only the selected nested shapes to the current destination indexes."""
+    selected = {}
+    for name in names:
+        field = dict(schema[name])
+        if field["is_nested"]:
+            field["per_sample_shapes"] = {
+                target: field["per_sample_shapes"][source]
+                for source, target in zip(source_indexes, target_indexes, strict=True)
+            }
+        selected[name] = field
+    return selected
+
+
+def _element_count(value: Any) -> int | None:
+    if hasattr(value, "shape") and isinstance(value.shape, tuple | list) and len(value.shape) > 0:
+        return value.shape[0]
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., Any], *args: Any) -> dict[str, Any]:
+    """Run a user ``data_parser(field_data, *args)`` and check it kept every key and element count."""
+    if not callable(data_parser):
+        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
+
+    original_lengths = {k: _element_count(v) for k, v in field_data.items()}
+    parsed = data_parser(field_data, *args)
+
+    if not isinstance(parsed, dict):
+        raise TypeError(f"data_parser must return a dict, got {type(parsed).__name__}")
+    if set(parsed) != set(original_lengths):
+        raise ValueError(
+            f"data_parser must not change dict keys. Original keys: {sorted(original_lengths)}, got: {sorted(parsed)}"
+        )
+    for k, v in parsed.items():
+        orig_len, new_len = original_lengths[k], _element_count(v)
+        if orig_len is not None and new_len is not None and orig_len != new_len:
+            raise ValueError(
+                f"data_parser changed the number of elements for key '{k}': expected {orig_len}, got {new_len}"
+            )
+    return parsed
 
 
 @ray.remote(num_cpus=1)
@@ -944,44 +1123,92 @@ class SimpleStorageUnit:
             if self._shutdown_event.is_set():
                 logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy shutting down...")
             else:
-                logger.error(f"[{self.storage_unit_id}]: ZMQ Proxy unexpected error: {e}")
+                logger.exception(f"[{self.storage_unit_id}]: ZMQ Proxy unexpected error: {e}")
+                # Without the proxy nothing reaches the worker, so the unit is as unreachable
+                # as if the worker itself had died.
+                self._abort_process("the ZMQ proxy thread died")
 
     def _worker_routine(self) -> None:
         """Worker thread for processing requests."""
-
-        worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
-        worker_socket.connect(self._inproc_addr)
-
-        poller = zmq.Poller()
-        poller.register(worker_socket, zmq.POLLIN)
-
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
 
-        while not self._shutdown_event.is_set():
-            monitor = self._metrics if self._metrics is not None else perf_monitor
-            try:
-                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
-                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
-            except zmq.error.ContextTerminated:
-                # ZMQ context was terminated, exit gracefully
-                logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
-                break
-            except Exception as e:
-                logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
-                continue
+        try:
+            self._worker_loop(perf_monitor)
+        except BaseException:
+            logger.critical(
+                f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception.", exc_info=True
+            )
+            self._abort_process("the worker thread died")
+            raise
+        finally:
+            logger.info(f"[{self.storage_unit_id}]: worker stopped.")
 
-            if self._shutdown_event.is_set():
-                break
+    def _abort_process(self, reason: str) -> None:
+        """Kill the whole unit process so it fails visibly instead of lingering as a dead unit.
 
-            if worker_socket in socks:
-                # Keep request handling in a separate scope so payload references are
-                # released before the worker waits for the next request.
-                self._process_one_worker_request(worker_socket, monitor)
+        The worker runs as a daemon thread, so re-raising only unwinds that thread while the
+        process, its ROUTER and the proxy stay up and keep queueing requests nobody will ever
+        answer. ``os._exit`` skips atexit/flush handlers that could themselves block here.
+        """
+        if self._shutdown_event.is_set():
+            return
 
-        logger.info(f"[{self.storage_unit_id}]: worker stopped.")
-        poller.unregister(worker_socket)
-        worker_socket.close(linger=0)
+        if not TQ_STORAGE_EXIT_ON_WORKER_DEATH:
+            logger.critical(
+                f"[{self.storage_unit_id}]: {reason}; staying up because "
+                f"TQ_STORAGE_EXIT_ON_WORKER_DEATH is disabled. Requests to this unit will hang."
+            )
+            return
+
+        logger.critical(
+            f"[{self.storage_unit_id}]: {reason}; exiting with code {_WORKER_DEATH_EXIT_CODE} so "
+            f"the unit fails visibly rather than lingering as one that cannot reply. "
+            f"Set TQ_STORAGE_EXIT_ON_WORKER_DEATH=0 to keep the process alive for inspection."
+        )
+        _flush_log_output()
+        os._exit(_WORKER_DEATH_EXIT_CODE)
+
+    def _connect_worker_socket(self, poller: zmq.Poller) -> zmq.Socket:
+        worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
+        worker_socket.connect(self._inproc_addr)
+        poller.register(worker_socket, zmq.POLLIN)
+        return worker_socket
+
+    def _worker_loop(self, perf_monitor: Any) -> None:
+        """Poll for requests and answer them until shutdown is signalled."""
+        poller = zmq.Poller()
+        worker_socket = self._connect_worker_socket(poller)
+        try:
+            while not self._shutdown_event.is_set():
+                monitor = self._metrics if self._metrics is not None else perf_monitor
+                try:
+                    # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                    socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+                except zmq.error.ContextTerminated:
+                    # ZMQ context was terminated, exit gracefully
+                    logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
+                    break
+                except Exception as e:
+                    logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
+                    continue
+
+                if self._shutdown_event.is_set():
+                    break
+
+                if worker_socket in socks:
+                    # Keep request handling in a separate scope so payload references are
+                    # released before the worker waits for the next request.
+                    try:
+                        self._process_one_worker_request(worker_socket, monitor)
+                    except Exception as e:
+                        logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
+                        # The socket may be left mid-message; a fresh one keeps the next reply routed correctly.
+                        poller.unregister(worker_socket)
+                        worker_socket.close(linger=0)
+                        worker_socket = self._connect_worker_socket(poller)
+        finally:
+            worker_socket.close(linger=0)
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
         """Validate parsed data and store it."""
@@ -1071,12 +1298,21 @@ class SimpleStorageUnit:
             if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="CLEAR_DATA"):
                     response_msg = self._handle_clear(request_msg)
+            elif response_msg is None and operation == ZMQRequestType.UPDATE_DATA:  # type: ignore[arg-type]
+                with monitor.measure(op_type="UPDATE_DATA"):
+                    response_msg = self._handle_update(request_msg)
             elif response_msg is None and operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                 response_msg = self._handle_get_metrics()
             elif response_msg is None and operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                 response_msg = self._handle_save_checkpoint(request_msg)
             elif response_msg is None and operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                 response_msg = self._handle_load_checkpoint(request_msg)
+            elif response_msg is None and operation == ZMQRequestType.DUMP_ROWS:  # type: ignore[arg-type]
+                with monitor.measure(op_type="DUMP_ROWS"):
+                    response_msg = self._handle_dump_rows(request_msg)
+            elif response_msg is None and operation == ZMQRequestType.LOAD_ROWS:  # type: ignore[arg-type]
+                with monitor.measure(op_type="LOAD_ROWS"):
+                    response_msg = self._handle_load_rows(request_msg)
             elif response_msg is None:
                 response_msg = ZMQMessage.create(
                     request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
@@ -1099,18 +1335,34 @@ class SimpleStorageUnit:
                 },
             )
 
-        response_frames = response_msg.serialize()
-        if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-            # This end serializes the get response, so its frames give the true wire size.
-            log_heavy_operation(
-                self.storage_unit_id,
-                "get",
-                time.perf_counter() - started,
-                sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                f"samples={len(request_msg.body.get('global_indexes', []))} "
-                f"fields={list(request_msg.body.get('fields', []))}",
+        # A get data_parser can return a value that fails to encode; reply with an error so the sole worker lives.
+        try:
+            response_frames = response_msg.serialize()
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_unit_id}]: failed to serialize response for {operation} "
+                f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
             )
+            response_frames = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_ERROR  # type: ignore[arg-type]
+                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
+                else ZMQRequestType.PUT_GET_ERROR,
+                sender_id=self.storage_unit_id,
+                body={"message": f"{self.storage_unit_id}: failed to serialize response: {type(e).__name__}: {e}"},
+            ).serialize()
+        else:
+            if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+                # This end serializes the get response, so its frames give the true wire size.
+                log_heavy_operation(
+                    self.storage_unit_id,
+                    "get",
+                    time.perf_counter() - started,
+                    sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                    f"samples={len(request_msg.body.get('global_indexes', []))} "
+                    f"fields={list(request_msg.body.get('fields', []))}",
+                )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
+
 
     @staticmethod
     def _field_length(value: Any) -> int | None:
@@ -1127,12 +1379,46 @@ class SimpleStorageUnit:
         except StorageKeyNotFoundError as exc:
             raise StorageKeyNotFoundError(f"{KEY_NOT_FOUND_MARKER}: {exc}") from exc
 
+    def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Merge or add fields, write once, and describe what was stored."""
+        try:
+            global_indexes = data_parts.body["global_indexes"]
+            merge_fn = data_parts.body.get("merge_fn")
+            new_data = data_parts.body.get("data")
+            merge_plan = data_parts.body.get("merge_plan")
+
+            with limit_pytorch_auto_parallel_threads(
+                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
+            ):
+                if not callable(merge_fn):
+                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+                if not isinstance(new_data, dict) or not new_data:
+                    raise TypeError("update data must be a non-empty dict")
+                if not isinstance(merge_plan, dict) or set(merge_plan) != set(new_data):
+                    raise ValueError("merge_plan must describe every update field")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, merge_plan)
+
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"stored_shapes": stored_shapes},
+            )
+        except Exception as e:
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_ERROR,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={
+                    "message": f"Failed to update data in storage unit id "
+                    f"#{self.storage_unit_id}, detail error message: {str(e)}"
+                },
+            )
+
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
         Handle clear request, clear data in storage unit according to given global_indexes.
 
         Args:
-            data_parts: ZMQMessage from client, including target global_indexes.
+            data_parts: ZMQMessage from client, including target global_indexes and optional fields.
 
         Returns:
             Clear data success response ZMQMessage.
@@ -1143,7 +1429,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
-                self.storage_data.clear(global_indexes)
+                self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -1201,16 +1487,17 @@ class SimpleStorageUnit:
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
             op_stats = {}
-            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
+            for op_type in ("PUT_DATA", "UPDATE_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
-                    counter = self._metrics.request_total.labels(op_type=op_type)
                     duration_sum = hist._sum.get()
                     # Build cumulative counts once, reuse for total and quantiles
                     cumulative_counts = self._cumulative_bucket_counts(hist)
                     duration_count = cumulative_counts[-1] if cumulative_counts else 0
                     op_stats[op_type] = {
-                        "request_count": counter._value.get(),
+                        # Observed when the handler returns or raises. request_total counts entry and
+                        # agrees only because this worker answers GET_METRICS after each handler.
+                        "request_count": duration_count,
                         "latency_avg": duration_sum / duration_count if duration_count > 0 else 0,
                         "latency_p50": self._quantile_from_cumulative(hist, cumulative_counts, 0.50),
                         "latency_p99": self._quantile_from_cumulative(hist, cumulative_counts, 0.99),
@@ -1252,6 +1539,104 @@ class SimpleStorageUnit:
             logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
+
+    def _handle_dump_rows(self, request: ZMQMessage) -> ZMQMessage:
+        """Write independent row records and return their offsets, never their payloads."""
+        path = request.body["path"]
+        fields_by_index = request.body["fields_by_index"]
+        try:
+            missing = fields_by_index.keys() - self.storage_data._active_keys
+            if missing:
+                raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
+            row_offsets = {}
+            row_schema = {}
+            with open(path, "wb") as f:
+                for index in sorted(fields_by_index):
+                    # Reused global indexes can retain fields no longer present in metadata.
+                    fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
+                    # Controller metadata can trail the stored values, so report what each
+                    # row actually holds; only type metadata leaves the unit.
+                    row_schema[index] = {
+                        name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+                        for name, value in fields.items()
+                    }
+                    offset = f.tell()
+                    compact_pickle.dump({"global_index": index, "fields": fields}, f)
+                    row_offsets[index] = [offset, f.tell() - offset]
+                f.flush()
+                os.fsync(f.fileno())
+            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={
+                    "success": True,
+                    "dumped_rows": len(fields_by_index),
+                    "missing_rows": [],
+                    "row_offsets": row_offsets,
+                    "row_schema": row_schema,
+                },
+            )
+        except Exception as e:
+            logger.error("[%s]: dump rows failed: %s", self.storage_unit_id, e)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
+
+    def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
+        """Seek to assigned records and merge them into local storage at current indexes."""
+        updates: list[dict[str, Any]] = []
+        bytes_read = 0
+        try:
+            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS):
+                for shard in request.body["shards"]:
+                    records = sorted(shard["records"], key=lambda row: row["offset"])
+                    with open(shard["path"], "rb", buffering=0) as f:
+                        # Bound temporary payload memory while retaining batched schema updates.
+                        for start in range(0, len(records), 128):
+                            groups = defaultdict(list)
+                            for row in records[start : start + 128]:
+                                fields = read_dump_row(
+                                    f, row["offset"], row["length"], row["source_index"], row["fields"]
+                                )
+                                validate_dump_values(fields, shard["field_schema"], row["source_index"])
+                                groups[(tuple(row["fields"]), tuple(row["unfinalized"]))].append((row, fields))
+                                bytes_read += row["length"]
+                            for (signature, unfinalized), rows in groups.items():
+                                indexes = [row["target_index"] for row, _ in rows]
+                                values = {name: [fields[name] for _, fields in rows] for name in signature}
+                                self.storage_data.put_data(values, indexes)
+                                source_indexes = [row["source_index"] for row, _ in rows]
+                                finalized = tuple(name for name in signature if name not in unfinalized)
+                                # Publish each field with the readiness it had when dumped.
+                                for names, ready in ((finalized, True), (unfinalized, False)):
+                                    if names:
+                                        schema = select_dump_schema(
+                                            shard["field_schema"], source_indexes, indexes, names
+                                        )
+                                        updates.append(
+                                            {"global_indexes": indexes, "field_schema": schema, "ready": ready}
+                                        )
+            logger.info(
+                "[%s]: loaded %s rows (%s bytes)",
+                self.storage_unit_id,
+                sum(len(update["global_indexes"]) for update in updates),
+                bytes_read,
+            )
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"success": True, "updates": updates, "bytes_read": bytes_read},
+            )
+        except Exception as e:
+            logger.error("[%s]: load rows failed: %s", self.storage_unit_id, e)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,
                 body={"success": False, "message": str(e)},
             )

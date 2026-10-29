@@ -16,26 +16,50 @@
 import os
 
 from .client import TransferQueueClient
+from .controller import PUBLIC_PARTITION
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
     async_kv_batch_get,
     async_kv_batch_get_by_meta,
     async_kv_batch_put,
+    async_kv_batch_update,
     async_kv_clear,
+    async_kv_clear_unlinked_public,
+    async_kv_describe,
+    async_kv_exists,
+    async_kv_link,
     async_kv_list,
     async_kv_put,
+    async_kv_update,
     close,
+    dump_data_by_key,
     get_client,
     get_metrics_endpoint,
     init,
     kv_batch_get,
     kv_batch_get_by_meta,
     kv_batch_put,
+    kv_batch_update,
     kv_clear,
+    kv_clear_unlinked_public,
+    kv_describe,
+    kv_exists,
+    kv_link,
     kv_list,
     kv_put,
+    kv_update,
     load_checkpoint,
+    load_data_by_key,
     save_checkpoint,
+)
+from .kv_lock import (
+    GlobalLease,
+    LockLostError,
+    async_kv_global_lock,
+    async_kv_local_lock,
+    kv_global_lock,
+    kv_local_lock,
+    kv_lock_list,
 )
 from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
@@ -53,22 +77,50 @@ __all__ = (
         "get_metrics_endpoint",
         "kv_put",
         "kv_batch_put",
+        "kv_batch_update",
         "kv_batch_get",
         "kv_batch_get_by_meta",
         "kv_list",
+        "kv_describe",
+        "kv_exists",
         "kv_clear",
+        "kv_link",
+        "kv_clear_unlinked_public",
+        "kv_update",
         "async_kv_put",
         "async_kv_batch_put",
+        "async_kv_batch_update",
         "async_kv_batch_get",
         "async_kv_batch_get_by_meta",
         "async_kv_list",
+        "async_kv_describe",
+        "async_kv_exists",
         "async_kv_clear",
+        "async_kv_link",
+        "async_kv_clear_unlinked_public",
+        "async_kv_update",
         "KVBatchMeta",
+        "PUBLIC_PARTITION",
+    ]
+    + [
+        # KV key locks: process-local and cluster-wide
+        "kv_local_lock",
+        "async_kv_local_lock",
+        "kv_global_lock",
+        "async_kv_global_lock",
+        "kv_lock_list",
+        "GlobalLease",
+        "LockLostError",
     ]
     + [
         # Checkpoint Interface
         "save_checkpoint",
         "load_checkpoint",
+    ]
+    + [
+        # Selective Data Dump Interface
+        "dump_data_by_key",
+        "load_data_by_key",
     ]
     + [
         # High-Level StreamingDataLoader Interface
