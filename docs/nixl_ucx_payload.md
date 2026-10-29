@@ -186,3 +186,14 @@ If it is not found, reinstall the NIXL wheel corresponding to the reported error
 ```bash
 python -m pip install --no-cache-dir --force-reinstall --no-deps nixl-cu12
 ```
+
+## UPDATE payloads
+
+With `payload_transfer.backend: nixl-ucx`, `kv_update` sends its new field values through
+NIXL, using the same registered-memory write flow as PUT. ZMQ carries the row indexes,
+merge function and plan, transfer descriptors, and the stored field descriptions returned
+by the storage unit. The storage unit merges values only at UPDATE COMMIT.
+
+UPDATE is never automatically retried, even if the commit response is lost: the merge
+may already have changed stored values. Cancellation releases a pending transfer; it does
+not undo a committed update. The default ZMQ backend keeps its inline UPDATE protocol.

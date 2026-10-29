@@ -125,6 +125,9 @@ class _PendingPut:
     sender_id: str
     global_indexes: tuple[int, ...]
     data_parser: Any
+    update: bool = False
+    merge_fn: Any = None
+    merge_plan: Any = None
 
 
 @dataclass
@@ -180,6 +183,57 @@ class NixlPayloadTransfer(PayloadTransfer):
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
     ) -> int:
+        wire_bytes, _ = await self._write(
+            control_socket=control_socket,
+            sender_id=sender_id,
+            target_id=target_id,
+            global_indexes=global_indexes,
+            data=data,
+            data_parser=data_parser,
+        )
+        return wire_bytes
+
+    async def update(
+        self,
+        *,
+        control_socket: Any,
+        sender_id: str,
+        target_id: str,
+        global_indexes: list[int],
+        data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+    ) -> tuple[int, dict[str, Any]]:
+        return await self._write(
+            control_socket=control_socket,
+            sender_id=sender_id,
+            target_id=target_id,
+            global_indexes=global_indexes,
+            data=data,
+            update=True,
+            merge_fn=merge_fn,
+            merge_plan=merge_plan,
+        )
+
+    async def _write(
+        self,
+        *,
+        control_socket: Any,
+        sender_id: str,
+        target_id: str,
+        global_indexes: list[int],
+        data: dict[str, Any],
+        data_parser: Any = None,
+        update: bool = False,
+        merge_fn: Any = None,
+        merge_plan: Any = None,
+    ) -> tuple[int, dict[str, Any]]:
+        prepare_type = ZMQRequestType.UPDATE_DATA_PREPARE if update else ZMQRequestType.PUT_DATA_PREPARE
+        ready_type = ZMQRequestType.UPDATE_DATA_READY if update else ZMQRequestType.PUT_DATA_READY
+        commit_type = ZMQRequestType.UPDATE_DATA_COMMIT if update else ZMQRequestType.PUT_DATA_COMMIT
+        response_type = ZMQRequestType.UPDATE_DATA_RESPONSE if update else ZMQRequestType.PUT_DATA_RESPONSE
+        cancel_type = ZMQRequestType.UPDATE_DATA_CANCEL if update else ZMQRequestType.PUT_DATA_CANCEL
+        operation = "UPDATE" if update else "PUT"
         frames = tuple(encode(data))
         descriptor = PayloadDescriptor(
             transfer_id=uuid4().hex,
@@ -190,43 +244,45 @@ class NixlPayloadTransfer(PayloadTransfer):
         remote_may_be_prepared = True
         try:
             prepare = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_PREPARE,
+                request_type=prepare_type,
                 sender_id=sender_id,
                 receiver_id=target_id,
                 body={
                     "global_indexes": global_indexes,
                     "descriptor": descriptor.to_dict(),
                     "data_parser": data_parser,
+                    "merge_fn": merge_fn,
+                    "merge_plan": merge_plan,
                 },
             )
             await control_socket.send_multipart(prepare.serialize(), copy=False)
             ready = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
-            self._expect(ready, ZMQRequestType.PUT_DATA_READY, target_id)
+            self._expect(ready, ready_type, target_id)
             if PayloadDescriptor.from_dict(ready.body["descriptor"]) != descriptor:
-                raise RuntimeError(f"PUT descriptor changed by storage unit {target_id}")
+                raise RuntimeError(f"{operation} descriptor changed by storage unit {target_id}")
             token = ReceiveToken.from_dict(ready.body["receive_token"])
             endpoint = self._peer_endpoint(target_id)
             await asyncio.wrap_future(self.send(endpoint, token, descriptor, frames))
 
             commit = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_COMMIT,
+                request_type=commit_type,
                 sender_id=sender_id,
                 receiver_id=target_id,
                 body={"transfer_id": descriptor.transfer_id},
             )
             await control_socket.send_multipart(commit.serialize(), copy=False)
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
-            self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_id)
+            self._expect(response, response_type, target_id)
             remote_may_be_prepared = False
-            return descriptor.payload_bytes
+            return descriptor.payload_bytes, response.body.get("stored_shapes", {})
         except BaseException as exc:
             if remote_may_be_prepared:
-                await self._cancel(sender_id, target_id, ZMQRequestType.PUT_DATA_CANCEL, descriptor.transfer_id)
+                await self._cancel(sender_id, target_id, cancel_type, descriptor.transfer_id)
             if isinstance(exc, zmq.error.Again):
-                # Only a missing answer is retried by the caller; the transfer_id above is
-                # fresh per attempt, so replaying the whole put cannot duplicate a commit.
+                # The manager never replays UPDATE: the merge may already have committed.
+                # PUT retry policy remains with the manager.
                 raise PayloadTransferTimeout(
-                    f"ZMQ recv timeout during put to storage unit {target_id}",
+                    f"ZMQ recv timeout during {operation.lower()} to storage unit {target_id}",
                     wire_bytes=descriptor.payload_bytes,
                 ) from exc
             raise
@@ -252,8 +308,11 @@ class NixlPayloadTransfer(PayloadTransfer):
                 sender_id=sender_id,
                 receiver_id=target_id,
                 body={
-                    "global_indexes": global_indexes, "fields": fields, "transfer_id": transfer_id,
-                    "data_parser": data_parser, "parser_args": parser_args,
+                    "global_indexes": global_indexes,
+                    "fields": fields,
+                    "transfer_id": transfer_id,
+                    "data_parser": data_parser,
+                    "parser_args": parser_args,
                 },
             )
             await control_socket.send_multipart(prepare.serialize(), copy=False)
@@ -298,13 +357,14 @@ class NixlPayloadTransfer(PayloadTransfer):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
+        update_data: Callable[..., dict[str, Any]] | None = None,
     ) -> ZMQMessage | None:
-        if request.request_type == ZMQRequestType.PUT_DATA_PREPARE:
-            return self._handle_put_prepare(request, storage_id)
-        if request.request_type == ZMQRequestType.PUT_DATA_COMMIT:
-            return self._handle_put_commit(request, storage_id, store_data)
-        if request.request_type == ZMQRequestType.PUT_DATA_CANCEL:
-            return self._handle_put_cancel(request, storage_id)
+        if request.request_type in (ZMQRequestType.PUT_DATA_PREPARE, ZMQRequestType.UPDATE_DATA_PREPARE):
+            return self._handle_write_prepare(request, storage_id)
+        if request.request_type in (ZMQRequestType.PUT_DATA_COMMIT, ZMQRequestType.UPDATE_DATA_COMMIT):
+            return self._handle_write_commit(request, storage_id, store_data, update_data)
+        if request.request_type in (ZMQRequestType.PUT_DATA_CANCEL, ZMQRequestType.UPDATE_DATA_CANCEL):
+            return self._handle_write_cancel(request, storage_id)
         if request.request_type == ZMQRequestType.GET_DATA_PREPARE:
             return self._handle_get_prepare(request, storage_id, load_data)
         if request.request_type == ZMQRequestType.GET_DATA_COMMIT:
@@ -313,13 +373,13 @@ class NixlPayloadTransfer(PayloadTransfer):
             return self._handle_get_cancel(request, storage_id)
         return None
 
-    def _handle_put_prepare(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
+    def _handle_write_prepare(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
         descriptor = None
         prepared = False
         try:
             descriptor = PayloadDescriptor.from_dict(request.body["descriptor"])
             if descriptor.transfer_id in self._pending_puts:
-                raise RuntimeError(f"duplicate PUT transfer_id: {descriptor.transfer_id}")
+                raise RuntimeError(f"duplicate write transfer_id: {descriptor.transfer_id}")
             token = self.prepare_receive(descriptor)
             prepared = True
             self._pending_puts[descriptor.transfer_id] = _PendingPut(
@@ -327,9 +387,16 @@ class NixlPayloadTransfer(PayloadTransfer):
                 request.sender_id,
                 tuple(request.body["global_indexes"]),
                 request.body.get("data_parser"),
+                request.request_type == ZMQRequestType.UPDATE_DATA_PREPARE,
+                request.body.get("merge_fn"),
+                request.body.get("merge_plan"),
             )
             return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_READY,
+                request_type=(
+                    ZMQRequestType.UPDATE_DATA_READY
+                    if request.request_type == ZMQRequestType.UPDATE_DATA_PREPARE
+                    else ZMQRequestType.PUT_DATA_READY
+                ),
                 sender_id=storage_id,
                 body={"descriptor": descriptor.to_dict(), "receive_token": token.to_dict()},
             )
@@ -337,47 +404,72 @@ class NixlPayloadTransfer(PayloadTransfer):
             if descriptor is not None and prepared:
                 self._pending_puts.pop(descriptor.transfer_id, None)
                 self.cancel_receive(descriptor.transfer_id)
-            return self._error(storage_id, "PUT prepare", exc)
+            return self._error(storage_id, "write prepare", exc)
 
-    def _handle_put_commit(self, request: ZMQMessage, storage_id: str, store_data: Callable[..., None]) -> ZMQMessage:
+    def _handle_write_commit(
+        self,
+        request: ZMQMessage,
+        storage_id: str,
+        store_data: Callable[..., None],
+        update_data: Callable[..., dict[str, Any]] | None = None,
+    ) -> ZMQMessage:
         transfer_id = request.body["transfer_id"]
         owns_receive = False
         try:
             pending = self._pending_puts.get(transfer_id)
             if pending is None:
-                raise RuntimeError(f"unknown or expired PUT transfer_id: {transfer_id}")
+                raise RuntimeError(f"unknown or expired write transfer_id: {transfer_id}")
             if pending.sender_id != request.sender_id:
-                raise RuntimeError(f"PUT transfer {transfer_id} belongs to another sender")
+                raise RuntimeError(f"write transfer {transfer_id} belongs to another sender")
+            if pending.update != (request.request_type == ZMQRequestType.UPDATE_DATA_COMMIT):
+                raise RuntimeError("write commit operation does not match prepare")
             self._pending_puts.pop(transfer_id)
             owns_receive = True
             payload = self.receive(pending.descriptor).result()
             with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] PUT commit"
+                target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] write commit"
             ):
-                store_data(list(pending.global_indexes), decode(unpack_from(payload)), pending.data_parser)
+                data = decode(unpack_from(payload))
+                stored_shapes = {}
+                if pending.update:
+                    if update_data is None:
+                        raise RuntimeError("storage unit does not support update")
+                    stored_shapes = update_data(
+                        list(pending.global_indexes), data, pending.merge_fn, pending.merge_plan
+                    )
+                else:
+                    store_data(list(pending.global_indexes), data, pending.data_parser)
             return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_RESPONSE,
+                request_type=(
+                    ZMQRequestType.UPDATE_DATA_RESPONSE
+                    if request.request_type == ZMQRequestType.UPDATE_DATA_COMMIT
+                    else ZMQRequestType.PUT_DATA_RESPONSE
+                ),
                 sender_id=storage_id,
-                body={"transfer_id": transfer_id},
+                body={"transfer_id": transfer_id, "stored_shapes": stored_shapes},
             )
         except Exception as exc:
             if owns_receive:
                 self.cancel_receive(transfer_id)
-            return self._error(storage_id, "PUT commit", exc)
+            return self._error(storage_id, "write commit", exc)
 
-    def _handle_put_cancel(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
+    def _handle_write_cancel(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
         transfer_id = request.body["transfer_id"]
         pending = self._pending_puts.get(transfer_id)
         if pending is not None and pending.sender_id != request.sender_id:
             return self._error(
                 storage_id,
-                "PUT cancel",
-                RuntimeError(f"PUT transfer {transfer_id} belongs to another sender"),
+                "write cancel",
+                RuntimeError(f"write transfer {transfer_id} belongs to another sender"),
             )
         self._pending_puts.pop(transfer_id, None)
         self.cancel_receive(transfer_id)
         return ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA_RESPONSE,
+            request_type=(
+                ZMQRequestType.UPDATE_DATA_RESPONSE
+                if request.request_type == ZMQRequestType.UPDATE_DATA_CANCEL
+                else ZMQRequestType.PUT_DATA_RESPONSE
+            ),
             sender_id=storage_id,
             body={"transfer_id": transfer_id},
         )
@@ -397,7 +489,8 @@ class NixlPayloadTransfer(PayloadTransfer):
                 target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] GET prepare"
             ):
                 data = load_data(
-                    request.body["fields"], request.body["global_indexes"],
+                    request.body["fields"],
+                    request.body["global_indexes"],
                     data_parser=request.body.get("data_parser"),
                     parser_args=request.body.get("parser_args"),
                 )
@@ -515,9 +608,13 @@ class NixlPayloadTransfer(PayloadTransfer):
             await cancel_socket.send_multipart(cancel.serialize(), copy=False)
             response = ZMQMessage.deserialize(await cancel_socket.recv_multipart(copy=False))
             expected = (
-                ZMQRequestType.PUT_DATA_RESPONSE
-                if request_type == ZMQRequestType.PUT_DATA_CANCEL
-                else ZMQRequestType.GET_DATA_RESPONSE
+                ZMQRequestType.UPDATE_DATA_RESPONSE
+                if request_type == ZMQRequestType.UPDATE_DATA_CANCEL
+                else (
+                    ZMQRequestType.PUT_DATA_RESPONSE
+                    if request_type == ZMQRequestType.PUT_DATA_CANCEL
+                    else ZMQRequestType.GET_DATA_RESPONSE
+                )
             )
             self._expect(response, expected, target_id)
         except Exception as exc:

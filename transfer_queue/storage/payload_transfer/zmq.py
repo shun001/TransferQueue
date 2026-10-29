@@ -64,6 +64,34 @@ class ZmqPayloadTransfer(PayloadTransfer):
         except zmq.error.Again as exc:
             raise PayloadTransferTimeout(f"no answer from storage unit {target_id}", wire_bytes=wire_bytes) from exc
 
+    async def update(
+        self,
+        *,
+        control_socket: Any,
+        sender_id: str,
+        target_id: str,
+        global_indexes: list[int],
+        data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+    ) -> tuple[int, dict[str, Any]]:
+        request = ZMQMessage.create(
+            request_type=ZMQRequestType.UPDATE_DATA,
+            sender_id=sender_id,
+            receiver_id=target_id,
+            body={"global_indexes": global_indexes, "data": data, "merge_fn": merge_fn, "merge_plan": merge_plan},
+        )
+        frames = request.serialize()
+        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+        try:
+            await control_socket.send_multipart(frames, copy=False)
+            response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
+            if response.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
+                raise RuntimeError(f"Update failed at {target_id}: {response.body.get('message', 'Unknown error')}")
+            return wire_bytes, response.body["stored_shapes"]
+        except zmq.error.Again as exc:
+            raise PayloadTransferTimeout(f"no answer from {target_id} during update", wire_bytes=wire_bytes) from exc
+
     async def get(
         self,
         *,
@@ -80,8 +108,10 @@ class ZmqPayloadTransfer(PayloadTransfer):
             sender_id=sender_id,
             receiver_id=target_id,
             body={
-                "global_indexes": global_indexes, "fields": fields,
-                "data_parser": data_parser, "parser_args": parser_args,
+                "global_indexes": global_indexes,
+                "fields": fields,
+                "data_parser": data_parser,
+                "parser_args": parser_args,
             },
         )
         try:
@@ -101,6 +131,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
+        update_data: Callable[..., dict[str, Any]] | None = None,
     ) -> ZMQMessage | None:
         if request.request_type == ZMQRequestType.PUT_DATA:
             try:
@@ -131,7 +162,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] _handle_get"
                 ):
                     data = load_data(
-                        fields, global_indexes,
+                        fields,
+                        global_indexes,
                         data_parser=request.body.get("data_parser"),
                         parser_args=request.body.get("parser_args"),
                     )

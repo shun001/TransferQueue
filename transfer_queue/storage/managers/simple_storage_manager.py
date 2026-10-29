@@ -46,7 +46,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    frame_nbytes,
     with_zmq_socket,
 )
 
@@ -711,34 +710,18 @@ class AsyncSimpleStorageManager(StorageManager):
         socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
         """Send an update to one storage unit and return what it stored, per field."""
-        body: dict[str, Any] = {
-            "global_indexes": global_indexes,
-            "data": storage_data,
-            "merge_fn": merge_fn,
-            "merge_plan": merge_plan,
-        }
-
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body=body,
-        )
-
         serialized_bytes = 0
         started = time.perf_counter()
         try:
-            frames = request_msg.serialize()
-            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-            await socket.send_multipart(frames, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to update data on storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
+            serialized_bytes, stored_shapes = await self.payload_transfer.update(
+                control_socket=socket,
+                sender_id=self.storage_manager_id,
+                target_id=target_storage_unit,
+                global_indexes=global_indexes,
+                data=storage_data,
+                merge_fn=merge_fn,
+                merge_plan=merge_plan,
+            )
             log_heavy_operation(
                 self.storage_manager_id,
                 "update",
@@ -747,12 +730,12 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
                 f"samples={len(global_indexes)} fields={list(storage_data)}",
             )
-            return response_msg.body.get("stored_shapes", {})
-        except zmq.error.Again as e:
+            return stored_shapes
+        except PayloadTransferTimeout as e:
             raise StorageUnitTimeout(
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during update to storage unit "
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"serialized_mb={serialized_bytes / 2**20:.1f}"
+                f"serialized_mb={e.wire_bytes / 2**20:.1f}"
             ) from e
         except Exception as e:
             logger.error(

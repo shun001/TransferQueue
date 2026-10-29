@@ -66,6 +66,20 @@ class PayloadTransfer(ABC):
         """
 
     @abstractmethod
+    async def update(
+        self,
+        *,
+        control_socket: Any,
+        sender_id: str,
+        target_id: str,
+        global_indexes: list[int],
+        data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        merge_plan: dict[str, dict[str, Any]],
+    ) -> tuple[int, dict[str, Any]]:
+        """Update once and return wire bytes and stored field descriptions; never replay a merge."""
+
+    @abstractmethod
     async def get(
         self,
         *,
@@ -87,6 +101,7 @@ class PayloadTransfer(ABC):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
+        update_data: Callable[..., dict[str, Any]] | None = None,
     ) -> ZMQMessage | None:
         """Handle a strategy-owned request on a SimpleStorageUnit."""
 

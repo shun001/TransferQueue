@@ -81,6 +81,8 @@ logger = get_logger(__name__)
 def _storage_arrival_op_type(operation: ZMQRequestType) -> str | None:
     """Count decoded operations while treating NIXL continuations as the same request."""
     if operation in (
+        ZMQRequestType.UPDATE_DATA_COMMIT,
+        ZMQRequestType.UPDATE_DATA_CANCEL,
         ZMQRequestType.PUT_DATA_COMMIT,
         ZMQRequestType.GET_DATA_COMMIT,
         ZMQRequestType.PUT_DATA_CANCEL,
@@ -88,6 +90,7 @@ def _storage_arrival_op_type(operation: ZMQRequestType) -> str | None:
     ):
         return None
     return {
+        ZMQRequestType.UPDATE_DATA_PREPARE: "UPDATE_DATA",
         ZMQRequestType.PUT_DATA_PREPARE: "PUT_DATA",
         ZMQRequestType.GET_DATA_PREPARE: "GET_DATA",
     }.get(operation, operation.name)
@@ -1276,6 +1279,7 @@ class SimpleStorageUnit:
             metric_op = {
                 ZMQRequestType.PUT_DATA: "PUT_DATA",
                 ZMQRequestType.GET_DATA: "GET_DATA",
+                ZMQRequestType.UPDATE_DATA_COMMIT: "UPDATE_DATA",
                 ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
                 ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
             }.get(operation)
@@ -1286,6 +1290,7 @@ class SimpleStorageUnit:
                         storage_id=self.storage_unit_id,
                         load_data=self._load_data,
                         store_data=self._put_decoded_data,
+                        update_data=self._update_decoded_data,
                     )
             else:
                 response_msg = self.payload_transfer.handle_request(
@@ -1293,6 +1298,7 @@ class SimpleStorageUnit:
                     storage_id=self.storage_unit_id,
                     load_data=self._load_data,
                     store_data=self._put_decoded_data,
+                    update_data=self._update_decoded_data,
                 )
 
             if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
@@ -1388,6 +1394,18 @@ class SimpleStorageUnit:
         except StorageKeyNotFoundError as exc:
             raise StorageKeyNotFoundError(f"{KEY_NOT_FOUND_MARKER}: {exc}") from exc
 
+    def _update_decoded_data(
+        self, global_indexes: list[int], new_data: dict[str, Any],
+        merge_fn: Callable[..., Any], merge_plan: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not callable(merge_fn):
+            raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+        if not isinstance(new_data, dict) or not new_data:
+            raise TypeError("update data must be a non-empty dict")
+        if not isinstance(merge_plan, dict) or set(merge_plan) != set(new_data):
+            raise ValueError("merge_plan must describe every update field")
+        return self.storage_data.apply_update(global_indexes, new_data, merge_fn, merge_plan)
+
     def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
         """Merge or add fields, write once, and describe what was stored."""
         try:
@@ -1399,13 +1417,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
             ):
-                if not callable(merge_fn):
-                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
-                if not isinstance(new_data, dict) or not new_data:
-                    raise TypeError("update data must be a non-empty dict")
-                if not isinstance(merge_plan, dict) or set(merge_plan) != set(new_data):
-                    raise ValueError("merge_plan must describe every update field")
-                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, merge_plan)
+                stored_shapes = self._update_decoded_data(global_indexes, new_data, merge_fn, merge_plan)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]
